@@ -1,1 +1,1 @@
-# aisecurity.github.io
+OSAI is OffSec's offensive AI security certification (AI-300). It applies the same adversary-first methodology from OSCP to AI-enabled systems — LLMs, agents, RAG pipelines, ML infrastructure. This isn't about prompt engineering. It's about breaking AI systems like an attacker.
