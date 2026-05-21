@@ -1,5 +1,6 @@
 import glob
 import hashlib
+import html
 import importlib.util
 import logging
 import os
@@ -85,9 +86,11 @@ def _format_subject_for_logging(subject: str) -> str:
 def _append_debug_log_line(line: str) -> None:
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
-        log_path = _current_log_path()
+        # In DEV_MODE, keep all diagnostic logs in the dev log file only.
+        log_path = _current_dev_log_path() if DEV_MODE else _current_log_path()
         rotate_log_if_needed(log_path)
-        delete_old_logs()
+        if not DEV_MODE:
+            delete_old_logs()
         with open(log_path, "a", encoding="utf-8") as log_file:
             log_file.write(line + "\n")
     except OSError:
@@ -209,8 +212,9 @@ def rotate_log_if_needed(log_path):
     """
     if os.path.exists(log_path) and os.path.getsize(log_path) > LOG_MAX_SIZE:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        rotated_name = f"{LOG_BASENAME}_{timestamp}{LOG_EXT}"
-        rotated_path = os.path.join(LOG_DIR, rotated_name)
+        base_name, ext = os.path.splitext(os.path.basename(log_path))
+        rotated_name = f"{base_name}_{timestamp}{ext or LOG_EXT}"
+        rotated_path = os.path.join(os.path.dirname(log_path), rotated_name)
         os.rename(log_path, rotated_path)
 
 def delete_old_logs():
@@ -239,9 +243,11 @@ def delete_old_logs():
 
 def setup_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
-    log_path = _current_log_path()
+    # In DEV_MODE, send the root logger output to the dev log only.
+    log_path = _current_dev_log_path() if DEV_MODE else _current_log_path()
     rotate_log_if_needed(log_path)
-    delete_old_logs()
+    if not DEV_MODE:
+        delete_old_logs()
     logging.basicConfig(
         filename=log_path,
         level=logging.INFO,
@@ -751,6 +757,114 @@ def _sanitize_excel_cell(value: object) -> object:
     if trimmed.startswith(EXCEL_FORMULA_PREFIXES):
         return "'" + value
     return value
+
+
+def _format_time_set(values: list[datetime]) -> str:
+    if not values:
+        return "N/A"
+    return ", ".join(sorted({dt.strftime("%H:%M:%S") for dt in values}))
+
+
+def _build_missing_notification_email_payload(
+    aaid: str,
+    tester_name: str,
+    daily_counts: dict[str, DailyNotificationCounts],
+) -> tuple[str, str]:
+    total_days = len(daily_counts)
+    missing_start_days = 0
+    missing_stop_days = 0
+    alert_days = 0
+
+    row_html: list[str] = []
+    for date_key in sorted(daily_counts.keys(), reverse=True):
+        counts = daily_counts[date_key]
+        is_alert = counts.start_count != 1 or counts.stop_count != 1
+        if counts.start_count == 0:
+            missing_start_days += 1
+        if counts.stop_count == 0:
+            missing_stop_days += 1
+        if is_alert:
+            alert_days += 1
+
+        status = "ALERT" if is_alert else "OK"
+        row_color = "#c62828" if is_alert else UI_TEXT
+
+        start_display = str(counts.start_count)
+        if counts.raw_start_count > 1:
+            start_display = f"{counts.start_count} ({counts.raw_start_count})"
+
+        stop_display = str(counts.stop_count)
+        if counts.raw_stop_count > 1:
+            stop_display = f"{counts.stop_count} ({counts.raw_stop_count})"
+
+        row_html.append(
+            "<tr>"
+            f"<td style='padding:6px 8px;border:1px solid #d9e2ec;color:{row_color};'>{html.escape(date_key)}</td>"
+            f"<td style='padding:6px 8px;border:1px solid #d9e2ec;color:{row_color};'>{html.escape(start_display)}</td>"
+            f"<td style='padding:6px 8px;border:1px solid #d9e2ec;color:{row_color};'>{html.escape(_format_time_set(counts.start_times))}</td>"
+            f"<td style='padding:6px 8px;border:1px solid #d9e2ec;color:{row_color};'>{html.escape(stop_display)}</td>"
+            f"<td style='padding:6px 8px;border:1px solid #d9e2ec;color:{row_color};'>{html.escape(_format_time_set(counts.stop_times))}</td>"
+            f"<td style='padding:6px 8px;border:1px solid #d9e2ec;color:{row_color};font-weight:{'600' if is_alert else '400'};'>{status}</td>"
+            "</tr>"
+        )
+
+    if not row_html:
+        row_html.append(
+            "<tr>"
+            "<td colspan='6' style='padding:8px;border:1px solid #d9e2ec;color:#334e68;'>"
+            "No daily notification records were found for the selected range."
+            "</td>"
+            "</tr>"
+        )
+
+    subject = f"Missing Start and Stop Summary - {aaid}"
+    body_html = (
+        "<div style='font-family:Segoe UI,Arial,sans-serif;font-size:10pt;color:#000000;'>"
+        f"<p>Hello {html.escape(tester_name)},</p>"
+        "<p>Here is the summary of missing Start and Stop notifications for your application.</p>"
+        "<ul style='margin-top:0;margin-bottom:12px;'>"
+        f"<li><b>AAID:</b> {html.escape(aaid)}</li>"
+        f"<li><b>Total days checked:</b> {total_days}</li>"
+        f"<li><b>Missing Start days:</b> {missing_start_days}</li>"
+        f"<li><b>Missing Stop days:</b> {missing_stop_days}</li>"
+        f"<li><b>Alert days:</b> {alert_days}</li>"
+        "</ul>"
+        "<table style='border-collapse:collapse;font-family:Segoe UI,Arial,sans-serif;font-size:10pt;color:#000000;'>"
+        "<thead>"
+        "<tr style='background:#dce8f7;'>"
+        "<th style='padding:6px 8px;border:1px solid #d9e2ec;text-align:left;'>Date</th>"
+        "<th style='padding:6px 8px;border:1px solid #d9e2ec;text-align:left;'>Start</th>"
+        "<th style='padding:6px 8px;border:1px solid #d9e2ec;text-align:left;'>Start Time(s)</th>"
+        "<th style='padding:6px 8px;border:1px solid #d9e2ec;text-align:left;'>Stop</th>"
+        "<th style='padding:6px 8px;border:1px solid #d9e2ec;text-align:left;'>Stop Time(s)</th>"
+        "<th style='padding:6px 8px;border:1px solid #d9e2ec;text-align:left;'>Status</th>"
+        "</tr>"
+        "</thead>"
+        "<tbody>"
+        f"{''.join(row_html)}"
+        "</tbody>"
+        "</table>"
+        "<p style='margin-top:12px;'>Please review and update the missing notifications.</p>"
+        "</div>"
+    )
+    return subject, body_html
+
+
+def _create_outlook_draft_email(to_recipients: str, subject: str, html_body: str) -> None:
+    import win32com.client
+    import pythoncom
+
+    pythoncom.CoInitialize()
+    try:
+        outlook = win32com.client.Dispatch("Outlook.Application")
+        draft = outlook.CreateItem(0)  # olMailItem
+        draft.To = to_recipients
+        draft.Subject = subject
+        draft.HTMLBody = html_body
+        draft.Save()
+        draft.Display()
+    finally:
+        pythoncom.CoUninitialize()
 
 
 def count_days_inclusive(start_day: date, end_day: date) -> int:
@@ -2499,7 +2613,48 @@ class DashboardUI:
                     pady=(top_pad, bottom_pad),
                 )
 
-        add_metric_pair(8, "Selected AAID:", self.selected_aaid, "Tester Name:", self.tester_name, top_pad=1, bottom_pad=1)
+        tk.Label(
+            detail_panel,
+            text="Selected AAID:",
+            bg=UI_PANEL,
+            fg=UI_TEXT,
+            font=(UI_FONT_FAMILY, 10),
+        ).grid(row=8, column=0, sticky="w", pady=(1, 1))
+        tk.Label(
+            detail_panel,
+            textvariable=self.selected_aaid,
+            anchor="w",
+            bg=UI_PANEL,
+            fg=UI_TEXT,
+            font=(UI_FONT_FAMILY, 10),
+        ).grid(row=8, column=1, sticky="ew", pady=(1, 1))
+        tk.Label(
+            detail_panel,
+            text="Tester Name:",
+            bg=UI_PANEL,
+            fg=UI_TEXT,
+            font=(UI_FONT_FAMILY, 10),
+        ).grid(row=8, column=2, sticky="w", pady=(1, 1), padx=(24, 0))
+
+        tester_row = tk.Frame(detail_panel, bg=UI_PANEL)
+        tester_row.grid(row=8, column=3, sticky="w", pady=(1, 1))
+        tk.Label(
+            tester_row,
+            textvariable=self.tester_name,
+            anchor="w",
+            bg=UI_PANEL,
+            fg=UI_TEXT,
+            font=(UI_FONT_FAMILY, 10),
+        ).pack(side="left")
+        self.notify_tester_btn = _new_button(
+            tester_row,
+            "Notify",
+            self._notify_missing_notifications,
+            variant="soft",
+            width=5,
+        )
+        self.notify_tester_btn.pack(side="left", padx=(8, 0))
+        self.notify_tester_btn.configure(state="disabled")
         add_metric_pair(9, "Start Notifications Count:", self.start_count, "Stop Notifications Count:", self.stop_count, top_pad=1, bottom_pad=1)
         add_metric_pair(10, "First Start Notification:", self.first_start_notification_at, "Last Stop Notification:", self.last_stop_notification_at, top_pad=1, bottom_pad=1)
         add_metric_pair(11, "Completion Days Count:", self.completion_days_count, "TechQA Send Date:", self.techqa_milestone_at, top_pad=1, bottom_pad=1)
@@ -2532,7 +2687,7 @@ class DashboardUI:
         self.daily_listbox = tk.Listbox(
             daily_inner,
             exportselection=False,
-            height=10,
+            height=6,
             bg="white",
             fg=UI_TEXT,
             bd=0,
@@ -2843,6 +2998,41 @@ class DashboardUI:
         self.finalqa_person.set(stats.finalqa_person or "N/A")
         self.is_test_run.set("Yes" if stats.is_test_run else "No")
         self.has_techqa_overlap.set("Yes" if stats.has_techqa_overlap else "No")
+        if hasattr(self, "notify_tester_btn"):
+            tester_name = (stats.first_start_notification_sender or "").strip()
+            self.notify_tester_btn.configure(state="normal" if tester_name else "disabled")
+
+    def _notify_missing_notifications(self) -> None:
+        selected_aaid = self.selected_aaid.get().strip()
+        if not selected_aaid or selected_aaid == "N/A":
+            messagebox.showinfo("No AAID Selected", "Select an AAID before creating a notification draft.")
+            return
+
+        stats = self.stats_by_aaid.get(selected_aaid)
+        if not stats:
+            messagebox.showinfo("No Data", "No stats found for the selected AAID.")
+            return
+
+        tester_name = (stats.first_start_notification_sender or "").strip()
+        if not tester_name:
+            messagebox.showinfo("Tester Missing", "Tester name is not available for this AAID.")
+            return
+
+        daily_counts = self.daily_counts_by_aaid.get(selected_aaid, {})
+        subject, body_html = _build_missing_notification_email_payload(
+            selected_aaid,
+            tester_name,
+            daily_counts,
+        )
+
+        try:
+            _create_outlook_draft_email(tester_name, subject, body_html)
+            self.status_var.set(f"Draft created for {tester_name} ({selected_aaid}).")
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(
+                "Draft Error",
+                _user_error_message("Unable to create Outlook draft email.", exc),
+            )
 
     def _go_prev_page(self) -> None:
         if self.aaid_current_page <= 0:
