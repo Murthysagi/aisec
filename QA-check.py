@@ -659,8 +659,11 @@ def _is_notification_stop_event(subject_text: str) -> bool:
 
 
 def _to_local_naive_wall_clock(value: datetime) -> datetime:
-    if value.tzinfo is not None:
-        return value.astimezone().replace(tzinfo=None)
+    # Preserve the wall-clock components exactly as shown by Outlook. Some
+    # providers return tz-aware timestamps whose offset metadata can cause
+    # unintended shifts (for example +5:30) when converted via astimezone().
+    # For dashboard reporting we want the displayed clock time, not converted
+    # absolute-time semantics.
     return datetime(
         value.year,
         value.month,
@@ -1402,6 +1405,25 @@ def get_date_range(range_option: str, custom_start: str, custom_end: str, now: O
             raise ValueError("Custom start date must be on or before end date.")
         return start_date, end_inclusive
     raise ValueError("Unsupported date range option.")
+
+
+def _business_date_keys_desc(start_date: Optional[datetime], end_date: Optional[datetime]) -> list[str]:
+    if start_date is None or end_date is None:
+        return []
+
+    first_day = start_date.date()
+    last_day = end_date.date()
+    if last_day < first_day:
+        return []
+
+    keys: list[str] = []
+    current_day = last_day
+    while current_day >= first_day:
+        # Daily notification completeness is tracked on business days.
+        if current_day.weekday() < 5:
+            keys.append(current_day.strftime("%Y-%m-%d"))
+        current_day -= timedelta(days=1)
+    return keys
 
 
 def build_export_rows(stats_by_aaid: dict[str, DashboardStats]) -> list[dict[str, str | int]]:
@@ -3390,13 +3412,25 @@ class DashboardUI:
                 self.daily_listbox.itemconfig(0, fg=UI_TEXT)
         
         daily_counts = self.daily_counts_by_aaid.get(aaid, {})
-        if not daily_counts:
+        sorted_dates = sorted(daily_counts.keys(), reverse=True)
+        try:
+            range_start, range_end = get_date_range(
+                self.range_option.get(),
+                self.custom_start_date.get(),
+                self.custom_end_date.get(),
+            )
+            business_dates = _business_date_keys_desc(range_start, range_end)
+            if business_dates:
+                sorted_dates = business_dates
+        except ValueError:
+            pass
+
+        if not sorted_dates:
             self.daily_listbox.insert(tk.END, "No notification entries for this AAID in selected range.")
             return
 
-        sorted_dates = sorted(daily_counts.keys(), reverse=True)
         for date_key in sorted_dates:
-            counts = daily_counts[date_key]
+            counts = daily_counts.get(date_key, DailyNotificationCounts())
             # Daily notifications are valid only when there is exactly 1 start and 1 stop.
             is_in_progress = _is_in_progress_workday(date_key, counts)
             is_alert = (counts.start_count != 1 or counts.stop_count != 1) and not is_in_progress
