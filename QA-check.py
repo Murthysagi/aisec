@@ -1053,7 +1053,7 @@ def parse_stats_by_aaid_from_messages(
     # Track all start notifications by AAID to capture sender of earliest one
     start_notifications_by_aaid: dict[str, list[tuple[Optional[datetime], Optional[str]]]] = {}
     unique_start_day_by_aaid: dict[str, set[str]] = {}
-    stop_event_times_by_aaid: dict[str, list[datetime]] = {}
+    unique_stop_day_by_aaid: dict[str, set[str]] = {}
 
     # First pass: collect stats and track start notifications
     for msg in message_list:
@@ -1112,8 +1112,8 @@ def parse_stats_by_aaid_from_messages(
                 start_unique = unique_start_day_by_aaid.setdefault(aaid, set())
                 start_unique.add(date_key)
             if is_stop_event:
-                stop_events = stop_event_times_by_aaid.setdefault(aaid, [])
-                stop_events.append(event_time)
+                stop_unique = unique_stop_day_by_aaid.setdefault(aaid, set())
+                stop_unique.add(date_key)
 
         if is_start_event:
             if aaid not in start_notifications_by_aaid:
@@ -1122,17 +1122,7 @@ def parse_stats_by_aaid_from_messages(
 
     for aaid, stats in stats_by_aaid.items():
         start_days = unique_start_day_by_aaid.get(aaid, set())
-        stop_times = stop_event_times_by_aaid.get(aaid, [])
-
-        stop_days: set[str] = set()
-        for stop_time in sorted(stop_times):
-            stop_date_key = stop_time.strftime("%Y-%m-%d")
-            if stop_time.hour < EARLY_STOP_CARRYOVER_CUTOFF_HOUR:
-                previous_date_key = (stop_time - timedelta(days=1)).strftime("%Y-%m-%d")
-                if previous_date_key in start_days and previous_date_key not in stop_days:
-                    stop_days.add(previous_date_key)
-                    continue
-            stop_days.add(stop_date_key)
+        stop_days = unique_stop_day_by_aaid.get(aaid, set())
 
         stats.start_notifications_count = len(start_days)
         stats.stop_notifications_count = len(stop_days)
@@ -1262,7 +1252,6 @@ def parse_daily_notification_counts_by_aaid(
     daily_counts_by_aaid: dict[str, dict[str, DailyNotificationCounts]] = {}
     seen_daily_start_presence: set[tuple[str, str]] = set()
     seen_daily_stop_presence: set[tuple[str, str]] = set()
-    early_morning_stops: list[tuple[str, datetime]] = []
 
     def _get_or_create_day_counts(target_aaid: str, target_date_key: str) -> DailyNotificationCounts:
         if target_aaid not in daily_counts_by_aaid:
@@ -1317,52 +1306,18 @@ def parse_daily_notification_counts_by_aaid(
                 day_counts.start_count += 1
 
         if is_stop_event:
-            # Defer early-morning STOP assignment until after all messages are
-            # parsed so carryover remains correct even if messages are unsorted.
-            if event_time.hour < EARLY_STOP_CARRYOVER_CUTOFF_HOUR:
-                early_morning_stops.append((aaid, event_time))
-                continue
-
             day_counts = _get_or_create_day_counts(aaid, date_key)
             day_bucket_key = (aaid, date_key)
             day_counts.raw_stop_count += 1
             day_counts.stop_times.append(event_time)
+            if event_time.hour < EARLY_STOP_CARRYOVER_CUTOFF_HOUR:
+                day_counts.has_midnight_stop_entry = True
             # Track the last stop time
             if day_counts.stop_time is None or event_time > day_counts.stop_time:
                 day_counts.stop_time = event_time
             if day_bucket_key not in seen_daily_stop_presence:
                 seen_daily_stop_presence.add(day_bucket_key)
                 day_counts.stop_count += 1
-
-    for aaid, stop_time in sorted(early_morning_stops, key=lambda item: item[1]):
-        actual_date_key = stop_time.strftime("%Y-%m-%d")
-        previous_date_key = (stop_time - timedelta(days=1)).strftime("%Y-%m-%d")
-        counts_by_day = daily_counts_by_aaid.get(aaid)
-        previous_counts = counts_by_day.get(previous_date_key) if counts_by_day else None
-        carried_to_previous_day = (
-            previous_counts is not None
-            and previous_counts.start_count >= 1
-            and previous_counts.stop_count == 0
-        )
-
-        if carried_to_previous_day:
-            previous_counts.stop_count = 1
-            previous_counts.stop_times.append(stop_time)
-            previous_counts.carried_stop_source_dates.append(actual_date_key)
-            if previous_counts.stop_time is None or stop_time > previous_counts.stop_time:
-                previous_counts.stop_time = stop_time
-            continue
-
-        actual_counts = _get_or_create_day_counts(aaid, actual_date_key)
-        day_bucket_key = (aaid, actual_date_key)
-        actual_counts.raw_stop_count += 1
-        actual_counts.stop_times.append(stop_time)
-        actual_counts.has_midnight_stop_entry = True
-        if actual_counts.stop_time is None or stop_time > actual_counts.stop_time:
-            actual_counts.stop_time = stop_time
-        if day_bucket_key not in seen_daily_stop_presence:
-            seen_daily_stop_presence.add(day_bucket_key)
-            actual_counts.stop_count += 1
 
     return daily_counts_by_aaid
 
@@ -3413,24 +3368,13 @@ class DashboardUI:
         
         daily_counts = self.daily_counts_by_aaid.get(aaid, {})
         sorted_dates = sorted(daily_counts.keys(), reverse=True)
-        try:
-            range_start, range_end = get_date_range(
-                self.range_option.get(),
-                self.custom_start_date.get(),
-                self.custom_end_date.get(),
-            )
-            business_dates = _business_date_keys_desc(range_start, range_end)
-            if business_dates:
-                sorted_dates = business_dates
-        except ValueError:
-            pass
 
         if not sorted_dates:
             self.daily_listbox.insert(tk.END, "No notification entries for this AAID in selected range.")
             return
 
         for date_key in sorted_dates:
-            counts = daily_counts.get(date_key, DailyNotificationCounts())
+            counts = daily_counts[date_key]
             # Daily notifications are valid only when there is exactly 1 start and 1 stop.
             is_in_progress = _is_in_progress_workday(date_key, counts)
             is_alert = (counts.start_count != 1 or counts.stop_count != 1) and not is_in_progress
