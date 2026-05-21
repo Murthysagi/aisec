@@ -322,6 +322,7 @@ AAID_PATTERNS = [
 ]
 EXCEL_FORMULA_PREFIXES = ("=", "+", "-", "@")
 MAX_EMAILS_LIMIT = 5000
+EARLY_STOP_CARRYOVER_CUTOFF_HOUR = 5
 ALL_MAILBOXES_OPTION = "All Mailboxes"
 RUNTIME_DEPENDENCIES: list[tuple[str, str]] = [
     ("pywin32", "win32com"),
@@ -1164,6 +1165,7 @@ def parse_daily_notification_counts_by_aaid(
     daily_counts_by_aaid: dict[str, dict[str, DailyNotificationCounts]] = {}
     seen_daily_start_presence: set[tuple[str, str]] = set()
     seen_daily_stop_presence: set[tuple[str, str]] = set()
+    early_morning_stops: list[tuple[str, datetime]] = []
 
     for message in messages:
         try:
@@ -1230,6 +1232,28 @@ def parse_daily_notification_counts_by_aaid(
             if day_bucket_key not in seen_daily_stop_presence:
                 seen_daily_stop_presence.add(day_bucket_key)
                 day_counts.stop_count += 1
+
+            # Treat STOPs that arrive shortly after midnight as completion for
+            # the previous day when that day has START but no STOP yet. Keep
+            # the current-day row untouched so it still appears as an alert row.
+            if event_time.hour < EARLY_STOP_CARRYOVER_CUTOFF_HOUR:
+                early_morning_stops.append((aaid, event_time))
+
+    for aaid, stop_time in sorted(early_morning_stops, key=lambda item: item[1]):
+        previous_date_key = (stop_time - timedelta(days=1)).strftime("%Y-%m-%d")
+        counts_by_day = daily_counts_by_aaid.get(aaid)
+        if not counts_by_day:
+            continue
+        previous_counts = counts_by_day.get(previous_date_key)
+        if previous_counts is None:
+            continue
+        if previous_counts.start_count < 1 or previous_counts.stop_count != 0:
+            continue
+
+        previous_counts.stop_count = 1
+        previous_counts.stop_times.append(stop_time)
+        if previous_counts.stop_time is None or stop_time > previous_counts.stop_time:
+            previous_counts.stop_time = stop_time
 
     return daily_counts_by_aaid
 
