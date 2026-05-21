@@ -12,14 +12,36 @@ import time
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
+import warnings
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from tkinter import filedialog, messagebox
 from typing import Iterable, Optional
 
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+
+    TRAY_SUPPORTED = True
+except ImportError:
+    pystray = None
+    Image = None
+    ImageDraw = None
+    TRAY_SUPPORTED = False
+
 
 # Avoid stale bytecode behavior during repeated local dashboard runs.
+# pip install tkcalendar pystray Pillow
 sys.dont_write_bytecode = True
+
+# Suppress a known third-party tkcalendar warning caused by an invalid escape
+# sequence in its packaged source (calendar_.py). This keeps runtime output
+# clean without modifying files inside .venv/site-packages.
+warnings.filterwarnings(
+    "ignore",
+    category=SyntaxWarning,
+    module=r"tkcalendar\.calendar_",
+)
 
 
 # Logging setup with rotation and retention
@@ -327,7 +349,11 @@ PROCEED_FINAL_QA_RE = re.compile(r"\bproceed\b.*\bfinal\s*qa\b|\bfinal\s*qa\b.*\
 AAID_PATTERNS = [
     re.compile(r"\bAAID\s*[:=-]\s*(AA\d+)\b", re.IGNORECASE),
     re.compile(r"\bAAID\s+(AA\d+)\b", re.IGNORECASE),
+    re.compile(r"\[\s*(AA\d+)\s*\]", re.IGNORECASE),
     re.compile(r"\b(AA\d+)\b", re.IGNORECASE),
+    re.compile(r"\b(ICTO\s*[-:]\s*\d+)\b", re.IGNORECASE),
+    re.compile(r"\[\s*(ICTO\s*[-:]\s*\d+)\s*\]", re.IGNORECASE),
+    re.compile(r"\b(ICTO[-:]\d+)\b", re.IGNORECASE),
 ]
 EXCEL_FORMULA_PREFIXES = ("=", "+", "-", "@")
 MAX_EMAILS_LIMIT = 5000
@@ -617,7 +643,19 @@ def extract_aaid(subject: str) -> str:
     for pattern in AAID_PATTERNS:
         match = pattern.search(clean_subject)
         if match:
-            return match.group(1).upper()
+            identifier = match.group(1).upper().replace(" ", "")
+            if identifier.startswith("ICTO:"):
+                identifier = identifier.replace("ICTO:", "ICTO-", 1)
+            return identifier
+    return "UNKNOWN"
+
+
+def _extract_aaid_from_message(subject_text: str, body_text: str) -> str:
+    aaid = extract_aaid(subject_text)
+    if aaid != "UNKNOWN":
+        return aaid
+    if body_text:
+        return extract_aaid(body_text)
     return "UNKNOWN"
 
 
@@ -822,6 +860,27 @@ def _sanitize_excel_cell(value: object) -> object:
     return value
 
 
+def _build_feedback_payload(
+    feedback_type: str,
+    details: str,
+    *,
+    timestamp: Optional[datetime] = None,
+) -> str:
+    created_at = timestamp or _system_now()
+    normalized_type = (feedback_type or "General feedback").strip() or "General feedback"
+    normalized_details = (details or "").strip() or "(No details provided)"
+    return "\n".join(
+        [
+            f"Type: {normalized_type}",
+            "Application: Outlook QA Dashboard",
+            f"Timestamp: {created_at.isoformat()}",
+            f"Python: {sys.version.split()[0]}",
+            "",
+            normalized_details,
+        ]
+    )
+
+
 def _format_time_set(values: list[datetime]) -> str:
     if not values:
         return "N/A"
@@ -977,9 +1036,16 @@ def _apply_message_to_stats(
 
 
 
-    # Exclude automatic replies from notification stats
-    lowered = subject_text.lower()
-    if "automatic reply" in lowered or "autoreply" in lowered or "auto-reply" in lowered:
+    # Exclude automatic replies from notification stats. The caller may pass
+    # combined subject+body text, so we look for auto-reply markers only at the
+    # leading portion (where Outlook surfaces them) to avoid dropping valid
+    # notifications whose bodies quote 'Automatic Reply' from a reply chain.
+    leading_text = subject_text[:200].lower()
+    if (
+        "automatic reply" in leading_text
+        or "autoreply" in leading_text
+        or "auto-reply" in leading_text
+    ):
         return
 
     is_start_event = _is_notification_start_event(subject_text)
@@ -1057,21 +1123,27 @@ def parse_stats_by_aaid_from_messages(
 
     # First pass: collect stats and track start notifications
     for msg in message_list:
-        subject, received_time, sender_name, _body_text = _unpack_message(msg)
-        if not subject:
+        subject, received_time, sender_name, body_text = _unpack_message(msg)
+        if not subject and not body_text:
             continue
+
+        message_text = _combine_message_text(subject, body_text)
 
         # Security: Check for pentest/attack patterns
         subject_threat = _detect_pentest_attempt(subject, "email_subject")
         if subject_threat:
-            _log_security_event(subject_threat, {"aaid": extract_aaid(subject), "sender": sender_name})
-        
+            _log_security_event(subject_threat, {"aaid": _extract_aaid_from_message(subject, body_text), "sender": sender_name})
+
+        body_threat = _detect_pentest_attempt(body_text, "email_body")
+        if body_threat:
+            _log_security_event(body_threat, {"aaid": _extract_aaid_from_message(subject, body_text), "sender": sender_name})
+
         sender_threat = _detect_pentest_attempt(sender_name or "", "sender_name")
         if sender_threat:
             _log_security_event(sender_threat, {"sender": sender_name})
 
         event_time = _message_event_time(received_time)
-        aaid = extract_aaid(subject)
+        aaid = _extract_aaid_from_message(subject, body_text)
         event_time_text = event_time.strftime("%Y-%m-%d %H:%M:%S") if event_time else "N/A"
         # DEBUG: Keep logs non-sensitive while still signaling parse activity.
         if debug_enabled:
@@ -1093,18 +1165,19 @@ def parse_stats_by_aaid_from_messages(
 
         _apply_message_to_stats(
             stats_by_aaid[aaid],
-            subject,
+            message_text,
             event_time,
             sender_name,
         )
 
-        # Track start notifications
-        lowered = subject.lower()
-        if "automatic reply" in lowered or "autoreply" in lowered or "auto-reply" in lowered:
+        # Track start notifications (auto-reply check uses subject only so
+        # body-quoted 'Automatic Reply' phrases don't drop valid entries).
+        subject_lowered = (subject or "").lower()
+        if "automatic reply" in subject_lowered or "autoreply" in subject_lowered or "auto-reply" in subject_lowered:
             continue
 
-        is_start_event = _is_notification_start_event(subject)
-        is_stop_event = _is_notification_stop_event(subject)
+        is_start_event = _is_notification_start_event(message_text)
+        is_stop_event = _is_notification_stop_event(message_text)
 
         if event_time is not None:
             date_key = event_time.strftime("%Y-%m-%d")
@@ -1262,22 +1335,23 @@ def parse_daily_notification_counts_by_aaid(
 
     for message in messages:
         try:
-            subject, received_time, sender_name, _body_text = _unpack_message(message)
+            subject, received_time, sender_name, body_text = _unpack_message(message)
         except ValueError:
             continue
-        if not subject:
+        if not subject and not body_text:
             continue
 
-        subject_text = str(subject)
+        message_text = _combine_message_text(subject, body_text)
 
-
-        # Exclude automatic replies from notification stats
-        lowered = subject_text.lower()
-        if "automatic reply" in lowered or "autoreply" in lowered or "auto-reply" in lowered:
+        # Exclude automatic replies from notification stats (subject-only check
+        # so body-quoted 'Automatic Reply' text in reply chains does not drop
+        # valid notification messages).
+        subject_lowered = (subject or "").lower()
+        if "automatic reply" in subject_lowered or "autoreply" in subject_lowered or "auto-reply" in subject_lowered:
             continue
 
-        is_start_event = _is_notification_start_event(subject_text)
-        is_stop_event = _is_notification_stop_event(subject_text)
+        is_start_event = _is_notification_start_event(message_text)
+        is_stop_event = _is_notification_stop_event(message_text)
         if not (is_start_event or is_stop_event):
             continue
 
@@ -1285,7 +1359,7 @@ def parse_daily_notification_counts_by_aaid(
         if not event_time:
             continue
 
-        aaid = extract_aaid(subject_text)
+        aaid = _extract_aaid_from_message(subject, body_text)
 
         # Filter by AAID if specified
         if filter_aaid is not None and aaid not in filter_aaid:
@@ -1531,16 +1605,18 @@ def compute_missing_notification_trends(
     day_aaid_status: dict[str, dict[str, dict[str, bool]]] = {}
 
     for message in messages:
-        subject, received_time, _sender_name, _body_text = _unpack_message(message)
-        if not subject:
+        subject, received_time, _sender_name, body_text = _unpack_message(message)
+        if not subject and not body_text:
             continue
+
+        message_text = _combine_message_text(subject, body_text)
 
         event_time = _message_event_time(received_time)
         if event_time is None:
             continue
 
         date_key = event_time.strftime("%Y-%m-%d")
-        aaid = extract_aaid(subject)
+        aaid = _extract_aaid_from_message(subject, body_text)
         if filter_aaid is not None and aaid not in filter_aaid:
             continue
 
@@ -1549,8 +1625,8 @@ def compute_missing_notification_trends(
         if aaid not in day_aaid_status[date_key]:
             day_aaid_status[date_key][aaid] = {"active": True, "start": False, "stop": False}
 
-        is_start_event = _is_notification_start_event(subject)
-        is_stop_event = _is_notification_stop_event(subject)
+        is_start_event = _is_notification_start_event(message_text)
+        is_stop_event = _is_notification_stop_event(message_text)
 
         if is_start_event:
             day_aaid_status[date_key][aaid]["start"] = True
@@ -1778,13 +1854,16 @@ def _read_messages_from_folder(
             continue
 
         subject = getattr(item, "Subject", "") or ""
+        body_text = getattr(item, "Body", "") or ""
+        message_text = _combine_message_text(subject, body_text)
 
-        # Must match strict keywords ([PENTEST], Tech QA, Final QA)
-        if not pentest_event_re.search(subject):
+        # Match notification/QA keywords from subject and body so entries are
+        # still captured when Outlook subject lines are generic.
+        if not pentest_event_re.search(message_text):
             continue
 
-        # If custom keywords provided, also require matching (AND condition)
-        if keywords and not any(kw in subject.lower() for kw in keywords):
+        # If custom keywords provided, require at least one keyword in subject/body.
+        if keywords and not any(kw in message_text.lower() for kw in keywords):
             skipped_by_filter_count += 1
             continue
 
@@ -1806,7 +1885,7 @@ def _read_messages_from_folder(
                 subject,
                 normalized_received or received_time,
                 _get_sender_name(item),
-                getattr(item, "Body", "") or "",
+                body_text,
             )
         )
         count += 1
@@ -2004,6 +2083,7 @@ class DashboardUI:
         self.custom_end_date = tk.StringVar(value="")
         self.aaid_filter = tk.StringVar(value="")
         self.debug_enabled = tk.BooleanVar(value=False)
+        self.run_in_background = tk.BooleanVar(value=False)
 
         self.selected_aaid = tk.StringVar(value="N/A")
         self.start_count = tk.StringVar(value="0")
@@ -2035,6 +2115,8 @@ class DashboardUI:
         self._mailbox_init_in_progress = False
         self._refresh_in_progress = False
         self._mailbox_warning_shown_once = False
+        self._tray_icon = None
+        self._tray_thread = None
 
         self.status_var = tk.StringVar(value="Ready.")
         status_row = tk.Frame(self.root, bg=UI_BG)
@@ -2085,6 +2167,22 @@ class DashboardUI:
         )
         debug_chk.pack(side="right", padx=(0, 8))
 
+        bg_mode_chk = tk.Checkbutton(
+            status_row,
+            text="Run in Background",
+            variable=self.run_in_background,
+            bg=UI_BG,
+            font=(UI_FONT_FAMILY, 10),
+            padx=4,
+            pady=1,
+            highlightthickness=0,
+            activebackground=UI_BG,
+            selectcolor=UI_BG,
+            bd=0,
+            command=self._on_background_mode_toggled,
+        )
+        bg_mode_chk.pack(side="right", padx=(0, 8))
+
         # Aggregate statistics StringVars (Statistics tab)
         self.stat_total_apps = tk.StringVar(value="0")
         self.stat_avg_techqa = tk.StringVar(value="N/A")
@@ -2102,9 +2200,84 @@ class DashboardUI:
         self._graph_resize_after_id: Optional[str] = None
 
         self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
         self.root.after(50, self._init_mailboxes_async)
         self._auto_adjust_max_emails()
         self._update_stat_date_range_preview()
+
+    def _on_background_mode_toggled(self) -> None:
+        if self.run_in_background.get():
+            if TRAY_SUPPORTED:
+                self.status_var.set("Background mode enabled. Closing window will hide to system tray (^ icon area).")
+            else:
+                self.status_var.set(
+                    "Background mode enabled. Install pystray + Pillow for tray icon; using taskbar minimize for now."
+                )
+        else:
+            self.status_var.set("Background mode disabled. Closing window will exit the app.")
+
+    def _on_window_close(self) -> None:
+        if self.run_in_background.get():
+            if TRAY_SUPPORTED:
+                self._hide_to_tray()
+            else:
+                self.root.iconify()
+                self.status_var.set("Running in background. Restore from taskbar or click Exit to close.")
+            return
+        self._exit_app()
+
+    def _create_tray_image(self):
+        # Simple generated app icon for the system tray.
+        image = Image.new("RGB", (64, 64), color="#16324f")
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((8, 8, 56, 56), fill="#5f8dd3")
+        draw.rectangle((16, 16, 48, 48), fill="#ffffff")
+        draw.rectangle((22, 22, 42, 42), fill="#16324f")
+        return image
+
+    def _on_tray_open(self, _icon=None, _item=None) -> None:
+        self.root.after(0, self._restore_from_tray)
+
+    def _on_tray_exit(self, _icon=None, _item=None) -> None:
+        self.root.after(0, self._exit_app)
+
+    def _run_tray_icon(self) -> None:
+        menu = pystray.Menu(
+            pystray.MenuItem("Open", self._on_tray_open, default=True),
+            pystray.MenuItem("Exit", self._on_tray_exit),
+        )
+        self._tray_icon = pystray.Icon(
+            "outlook_qa_dashboard",
+            self._create_tray_image(),
+            "Outlook QA Dashboard",
+            menu,
+        )
+        self._tray_icon.run()
+
+    def _hide_to_tray(self) -> None:
+        self.root.withdraw()
+        if self._tray_thread and self._tray_thread.is_alive():
+            return
+        self._tray_thread = threading.Thread(target=self._run_tray_icon, daemon=True)
+        self._tray_thread.start()
+
+    def _stop_tray_icon(self) -> None:
+        if self._tray_icon is not None:
+            try:
+                self._tray_icon.stop()
+            except Exception:
+                pass
+            self._tray_icon = None
+
+    def _restore_from_tray(self) -> None:
+        self._stop_tray_icon()
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def _exit_app(self) -> None:
+        self._stop_tray_icon()
+        self.root.destroy()
 
     def _log_debug(self, message: str) -> None:
         if not self.debug_enabled.get():
@@ -2632,7 +2805,8 @@ class DashboardUI:
         button_frame.grid(row=6, column=1, sticky="w", pady=4)
         self.refresh_btn = _new_button(button_frame, "Refresh", self.refresh, variant="primary")
         self.refresh_btn.grid(row=0, column=0, padx=(0, 6))
-        _new_button(button_frame, "Export to Excel", self.export_excel, variant="success").grid(row=0, column=1)
+        _new_button(button_frame, "Export to Excel", self.export_excel, variant="success").grid(row=0, column=1, padx=(0, 6))
+        _new_button(button_frame, "Exit", self._exit_app, variant="danger").grid(row=0, column=2)
 
         results_frame = tk.Frame(frame, bg=UI_BG)
         results_frame.grid(row=7, column=0, columnspan=5, sticky="nsew", pady=(0, 6))
