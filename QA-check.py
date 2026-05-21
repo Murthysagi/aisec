@@ -1060,17 +1060,19 @@ def parse_stats_by_aaid_from_messages(
 
         event_time = _message_event_time(received_time)
         aaid = extract_aaid(subject)
+        event_time_text = event_time.strftime("%Y-%m-%d %H:%M:%S") if event_time else "N/A"
         # DEBUG: Keep logs non-sensitive while still signaling parse activity.
         if debug_enabled:
             _append_debug_log_line(
-                f"[{datetime.now().isoformat()}] [PARSE] { _format_subject_for_logging(subject) }"
+                f"[{datetime.now().isoformat()}] [PARSE] event_time={event_time_text} { _format_subject_for_logging(subject) }"
             )
-            # DEV_MODE: Log full details with sender and timestamp
-            if DEV_MODE:
-                _append_dev_log_line(
-                    f"[{datetime.now().isoformat()}] [PARSE] AAID={aaid} | "
-                    f"Sender={sender_name} | Subject={subject[:500]}"
-                )
+        # DEV_MODE: Always log parse-level details in dev log even if UI debug
+        # checkbox is off, so troubleshooting can rely on one source.
+        if DEV_MODE:
+            _append_dev_log_line(
+                f"[{datetime.now().isoformat()}] [PARSE] AAID={aaid} | "
+                f"EventTime={event_time_text} | Sender={sender_name} | Subject={subject[:500]}"
+            )
         # Filter by AAID if specified
         if filter_aaid is not None and aaid not in filter_aaid:
             continue
