@@ -29,6 +29,7 @@ LOG_BASENAME = "outlook_qa_dashboard_debug"
 LOG_EXT = ".log"
 SECURITY_LOG_BASENAME = "outlook_qa_dashboard_security"
 DEV_LOG_BASENAME = "outlook_qa_dashboard_dev"
+DEV_LOG_SESSION_STAMP = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 LOG_MAX_SIZE = 1 * 1024 * 1024  # 1 MB
 LOG_RETENTION_DAYS = 7
 
@@ -72,6 +73,10 @@ def _current_security_log_path() -> str:
     return os.path.join(LOG_DIR, f"{SECURITY_LOG_BASENAME}{LOG_EXT}")
 
 def _current_dev_log_path() -> str:
+    # In DEV_MODE, use a per-run timestamped file so logs do not append
+    # to previous sessions.
+    if DEV_MODE:
+        return os.path.join(LOG_DIR, f"{DEV_LOG_BASENAME}_{DEV_LOG_SESSION_STAMP}{LOG_EXT}")
     return os.path.join(LOG_DIR, f"{DEV_LOG_BASENAME}{LOG_EXT}")
 
 
