@@ -18,6 +18,10 @@ from tkinter import filedialog, messagebox
 from typing import Iterable, Optional
 
 
+# Avoid stale bytecode behavior during repeated local dashboard runs.
+sys.dont_write_bytecode = True
+
+
 # Logging setup with rotation and retention
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(APP_DIR, "logs")
@@ -1493,20 +1497,19 @@ def compute_aggregate_statistics(
                 + (stats.finalqa_stop - stats.finalqa_start).total_seconds()
             )
         # Missing notification totals are day-based when daily records are
-        # available so they match the Daily Notification Check semantics.
+        # available so they match actionable AAID-level statistics semantics.
         start_count = stats.start_notifications_count
         stop_count = stats.stop_notifications_count
         if daily_counts_by_aaid is not None:
             daily_counts = daily_counts_by_aaid.get(aaid, {})
-            for date_key, counts in daily_counts.items():
-                if counts.start_count < counts.stop_count:
-                    aggregate.missing_start_count += counts.stop_count - counts.start_count
-                if counts.stop_count < counts.start_count and not _is_in_progress_workday(
-                    date_key,
-                    counts,
-                    reference_date,
-                ):
-                    aggregate.missing_stop_count += counts.start_count - counts.stop_count
+            has_missing_start, has_missing_stop = _compute_actionable_imbalance_flags(
+                daily_counts,
+                reference_date,
+            )
+            if has_missing_start:
+                aggregate.missing_start_count += 1
+            if has_missing_stop:
+                aggregate.missing_stop_count += 1
         else:
             has_any_start_or_stop = start_count > 0 or stop_count > 0
             if has_any_start_or_stop:
