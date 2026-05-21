@@ -635,6 +635,20 @@ def _strip_prefixes(subject: str) -> str:
     return re.sub(r"^(\s*(RE|FW|FWD)\s*[:：])+", "", subject, flags=re.IGNORECASE).strip()
 
 
+def _is_notification_start_event(subject_text: str) -> bool:
+    is_start = _is_start(subject_text)
+    is_bracket_start = "[START]" in subject_text.upper()
+    is_notification_type = _is_notification(subject_text)
+    return is_bracket_start or (is_notification_type and is_start)
+
+
+def _is_notification_stop_event(subject_text: str) -> bool:
+    is_stop = _is_stop(subject_text)
+    is_bracket_stop = "[STOP]" in subject_text.upper()
+    is_notification_type = _is_notification(subject_text)
+    return is_bracket_stop or (is_notification_type and is_stop)
+
+
 def _to_local_naive_wall_clock(value: datetime) -> datetime:
     if value.tzinfo is not None:
         return value.astimezone().replace(tzinfo=None)
@@ -915,6 +929,8 @@ def _apply_message_to_stats(
     if "automatic reply" in lowered or "autoreply" in lowered or "auto-reply" in lowered:
         return
 
+    is_start_event = _is_notification_start_event(subject_text)
+    is_stop_event = _is_notification_stop_event(subject_text)
     is_start = _is_start(subject_text)
     is_stop = _is_stop(subject_text)
     is_bracket_start = "[START]" in subject_text.upper()
@@ -941,13 +957,12 @@ def _apply_message_to_stats(
             f"is_notification_type={is_notification_type}"
         )
 
-    # Only count if [PENTEST] is present in subject
-    if is_pentest and (is_bracket_start or (is_notification_type and is_start)):
+    if is_start_event:
         stats.raw_start_notifications_count += 1
         stats.start_notifications_count += 1
         previous_first_start = stats.first_start_notification_at
         stats.first_start_notification_at = _earliest(stats.first_start_notification_at, event_time)
-    if is_pentest and (is_bracket_stop or (is_notification_type and is_stop)):
+    if is_stop_event:
         stats.raw_stop_notifications_count += 1
         stats.stop_notifications_count += 1
         stats.last_stop_notification_at = _latest(stats.last_stop_notification_at, event_time)
@@ -1033,23 +1048,19 @@ def parse_stats_by_aaid_from_messages(
         if "automatic reply" in lowered or "autoreply" in lowered or "auto-reply" in lowered:
             continue
 
-        is_start = _is_start(subject)
-        is_stop = _is_stop(subject)
-        is_bracket_start = "[START]" in subject.upper()
-        is_bracket_stop = "[STOP]" in subject.upper()
-        is_notification_type = _is_notification(subject)
-        is_pentest = "[PENTEST]" in subject.upper()
+        is_start_event = _is_notification_start_event(subject)
+        is_stop_event = _is_notification_stop_event(subject)
 
-        if event_time is not None and is_pentest:
+        if event_time is not None:
             date_key = event_time.strftime("%Y-%m-%d")
-            if is_bracket_start or (is_notification_type and is_start):
+            if is_start_event:
                 start_unique = unique_start_day_by_aaid.setdefault(aaid, set())
                 start_unique.add(date_key)
-            if is_bracket_stop or (is_notification_type and is_stop):
+            if is_stop_event:
                 stop_events = stop_event_times_by_aaid.setdefault(aaid, [])
                 stop_events.append(event_time)
 
-        if is_bracket_start or (is_notification_type and is_start):
+        if is_start_event:
             if aaid not in start_notifications_by_aaid:
                 start_notifications_by_aaid[aaid] = []
             start_notifications_by_aaid[aaid].append((event_time, sender_name))
@@ -1221,15 +1232,9 @@ def parse_daily_notification_counts_by_aaid(
         if "automatic reply" in lowered or "autoreply" in lowered or "auto-reply" in lowered:
             continue
 
-        is_start = _is_start(subject_text)
-        is_stop = _is_stop(subject_text)
-        is_bracket_start = "[START]" in subject_text.upper()
-        is_bracket_stop = "[STOP]" in subject_text.upper()
-        is_notification_type = _is_notification(subject_text)
-        is_pentest = "[PENTEST]" in subject_text.upper()
-
-        # Only count if [PENTEST] is present in subject
-        if not (is_pentest and ((is_bracket_start or is_bracket_stop) or (is_notification_type and (is_start or is_stop)))):
+        is_start_event = _is_notification_start_event(subject_text)
+        is_stop_event = _is_notification_stop_event(subject_text)
+        if not (is_start_event or is_stop_event):
             continue
 
         event_time = _to_datetime(received_time)
@@ -1244,7 +1249,7 @@ def parse_daily_notification_counts_by_aaid(
 
         date_key = event_time.strftime("%Y-%m-%d")
 
-        if is_bracket_start or (is_notification_type and is_start):
+        if is_start_event:
             day_counts = _get_or_create_day_counts(aaid, date_key)
             day_bucket_key = (aaid, date_key)
             day_counts.raw_start_count += 1
@@ -1256,7 +1261,7 @@ def parse_daily_notification_counts_by_aaid(
                 seen_daily_start_presence.add(day_bucket_key)
                 day_counts.start_count += 1
 
-        if is_bracket_stop or (is_notification_type and is_stop):
+        if is_stop_event:
             # Defer early-morning STOP assignment until after all messages are
             # parsed so carryover remains correct even if messages are unsorted.
             if event_time.hour < EARLY_STOP_CARRYOVER_CUTOFF_HOUR:
@@ -1516,16 +1521,12 @@ def compute_missing_notification_trends(
         if aaid not in day_aaid_status[date_key]:
             day_aaid_status[date_key][aaid] = {"active": True, "start": False, "stop": False}
 
-        is_start = _is_start(subject)
-        is_stop = _is_stop(subject)
-        is_bracket_start = "[START]" in subject.upper()
-        is_bracket_stop = "[STOP]" in subject.upper()
-        is_notification_type = _is_notification(subject)
-        is_pentest = "[PENTEST]" in subject.upper()
+        is_start_event = _is_notification_start_event(subject)
+        is_stop_event = _is_notification_stop_event(subject)
 
-        if is_pentest and (is_bracket_start or (is_notification_type and is_start)):
+        if is_start_event:
             day_aaid_status[date_key][aaid]["start"] = True
-        if is_pentest and (is_bracket_stop or (is_notification_type and is_stop)):
+        if is_stop_event:
             day_aaid_status[date_key][aaid]["stop"] = True
 
     dates = sorted(day_aaid_status.keys())
@@ -1735,7 +1736,7 @@ def _read_messages_from_folder(
     # related messages (these keywords drive the dashboard's QA milestones).
     # If custom keywords are provided, also require matching those keywords (AND logic).
     pentest_event_re = re.compile(
-        r"\[PENTEST\]|\btech\s*qa\b|\btechqa\b|\bfinal\s*qa\b|\bfinalqa\b",
+        r"\[PENTEST\]|\[START\]|\[STOP\]|\bstart(?:ed)?\b|\bstop(?:ped)?\b|\bend(?:ed)?\b|\btech\s*qa\b|\btechqa\b|\bfinal\s*qa\b|\bfinalqa\b",
         re.IGNORECASE,
     )
 
