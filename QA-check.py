@@ -408,6 +408,7 @@ class DailyNotificationCounts:
     stop_time: Optional[datetime] = None
     start_times: list[datetime] = field(default_factory=list)
     stop_times: list[datetime] = field(default_factory=list)
+    has_midnight_stop_entry: bool = False
 
 
 class OutlookFolderNotFoundError(Exception):
@@ -967,7 +968,7 @@ def parse_stats_by_aaid_from_messages(
     # Track all start notifications by AAID to capture sender of earliest one
     start_notifications_by_aaid: dict[str, list[tuple[Optional[datetime], Optional[str]]]] = {}
     unique_start_day_by_aaid: dict[str, set[str]] = {}
-    unique_stop_day_by_aaid: dict[str, set[str]] = {}
+    stop_event_times_by_aaid: dict[str, list[datetime]] = {}
 
     # First pass: collect stats and track start notifications
     for msg in message_list:
@@ -1028,8 +1029,8 @@ def parse_stats_by_aaid_from_messages(
                 start_unique = unique_start_day_by_aaid.setdefault(aaid, set())
                 start_unique.add(date_key)
             if is_bracket_stop or (is_notification_type and is_stop):
-                stop_unique = unique_stop_day_by_aaid.setdefault(aaid, set())
-                stop_unique.add(date_key)
+                stop_events = stop_event_times_by_aaid.setdefault(aaid, [])
+                stop_events.append(event_time)
 
         if is_bracket_start or (is_notification_type and is_start):
             if aaid not in start_notifications_by_aaid:
@@ -1037,8 +1038,21 @@ def parse_stats_by_aaid_from_messages(
             start_notifications_by_aaid[aaid].append((event_time, sender_name))
 
     for aaid, stats in stats_by_aaid.items():
-        stats.start_notifications_count = len(unique_start_day_by_aaid.get(aaid, set()))
-        stats.stop_notifications_count = len(unique_stop_day_by_aaid.get(aaid, set()))
+        start_days = unique_start_day_by_aaid.get(aaid, set())
+        stop_times = stop_event_times_by_aaid.get(aaid, [])
+
+        stop_days: set[str] = set()
+        for stop_time in sorted(stop_times):
+            stop_date_key = stop_time.strftime("%Y-%m-%d")
+            if stop_time.hour < EARLY_STOP_CARRYOVER_CUTOFF_HOUR:
+                previous_date_key = (stop_time - timedelta(days=1)).strftime("%Y-%m-%d")
+                if previous_date_key in start_days and previous_date_key not in stop_days:
+                    stop_days.add(previous_date_key)
+                    continue
+            stop_days.add(stop_date_key)
+
+        stats.start_notifications_count = len(start_days)
+        stats.stop_notifications_count = len(stop_days)
     
     # Second pass: set sender for earliest start notification
     for aaid, start_notifications in start_notifications_by_aaid.items():
@@ -1237,6 +1251,7 @@ def parse_daily_notification_counts_by_aaid(
             # the previous day when that day has START but no STOP yet. Keep
             # the current-day row untouched so it still appears as an alert row.
             if event_time.hour < EARLY_STOP_CARRYOVER_CUTOFF_HOUR:
+                day_counts.has_midnight_stop_entry = True
                 early_morning_stops.append((aaid, event_time))
 
     for aaid, stop_time in sorted(early_morning_stops, key=lambda item: item[1]):
@@ -2318,6 +2333,7 @@ class DashboardUI:
         preset_max_emails = {
             "last 1 week": 200,
             "last 1 month": 500,
+            "last 2 months": 1000,
             "last 3 months": 1500,
             "last 6 months": 3000,
         }
@@ -2445,6 +2461,7 @@ class DashboardUI:
             values=[
                 "Last 1 Week",
                 "Last 1 Month",
+                "Last 2 Months",
                 "Last 3 Months",
                 "Last 6 Months",
                 "Custom Range",
