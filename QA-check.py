@@ -635,32 +635,30 @@ def _strip_prefixes(subject: str) -> str:
     return re.sub(r"^(\s*(RE|FW|FWD)\s*[:：])+", "", subject, flags=re.IGNORECASE).strip()
 
 
+def _to_local_naive_wall_clock(value: datetime) -> datetime:
+    if value.tzinfo is not None:
+        return value.astimezone().replace(tzinfo=None)
+    return datetime(
+        value.year,
+        value.month,
+        value.day,
+        value.hour,
+        value.minute,
+        value.second,
+        value.microsecond,
+    )
+
+
 def _to_datetime(received_time) -> Optional[datetime]:
-    # Preserve Outlook wall-clock time exactly so fetched timestamps match what
-    # the user sees in Outlook UI.
+    # Normalize aware timestamps to local wall-clock before dropping tzinfo so
+    # day grouping stays aligned with Outlook's local date display.
     if isinstance(received_time, datetime):
-        return datetime(
-            received_time.year,
-            received_time.month,
-            received_time.day,
-            received_time.hour,
-            received_time.minute,
-            received_time.second,
-            received_time.microsecond,
-        )
+        return _to_local_naive_wall_clock(received_time)
     if received_time is None:
         return None
     try:
         parsed = datetime.fromisoformat(str(received_time))
-        return datetime(
-            parsed.year,
-            parsed.month,
-            parsed.day,
-            parsed.hour,
-            parsed.minute,
-            parsed.second,
-            parsed.microsecond,
-        )
+        return _to_local_naive_wall_clock(parsed)
     except ValueError:
         return None
 
@@ -668,12 +666,7 @@ def _to_datetime(received_time) -> Optional[datetime]:
 def _normalize_for_comparison(value: Optional[datetime]) -> Optional[datetime]:
     if value is None:
         return None
-    if value.tzinfo is not None:
-        # Outlook ReceivedTime is already displayed in local wall time for the
-        # current profile. Preserve that wall-clock and only drop tzinfo so
-        # date bucketing doesn't shift yesterday mails into today.
-        return value.replace(tzinfo=None)
-    return value
+    return _to_local_naive_wall_clock(value)
 
 
 def _latest(current: Optional[datetime], candidate: Optional[datetime]) -> Optional[datetime]:
@@ -1451,23 +1444,24 @@ def compute_aggregate_statistics(
                 (stats.techqa_stop - stats.techqa_start).total_seconds()
                 + (stats.finalqa_stop - stats.finalqa_start).total_seconds()
             )
-        # Only count AAIDs that have at least one START or STOP notification (exclude QA-only).
-        # Treat today's START-without-STOP as in-progress until workday ends.
+        # Missing notification totals are day-based when daily records are
+        # available so they match the Daily Notification Check semantics.
         start_count = stats.start_notifications_count
         stop_count = stats.stop_notifications_count
-        has_any_start_or_stop = start_count > 0 or stop_count > 0
-        if has_any_start_or_stop:
-            if daily_counts_by_aaid is not None:
-                daily_counts = daily_counts_by_aaid.get(aaid, {})
-                has_missing_start, has_missing_stop = _compute_actionable_imbalance_flags(
-                    daily_counts,
-                    reference_date=reference_date,
-                )
-                if has_missing_start:
-                    aggregate.missing_start_count += 1
-                if has_missing_stop:
-                    aggregate.missing_stop_count += 1
-            else:
+        if daily_counts_by_aaid is not None:
+            daily_counts = daily_counts_by_aaid.get(aaid, {})
+            for date_key, counts in daily_counts.items():
+                if counts.start_count < counts.stop_count:
+                    aggregate.missing_start_count += counts.stop_count - counts.start_count
+                if counts.stop_count < counts.start_count and not _is_in_progress_workday(
+                    date_key,
+                    counts,
+                    reference_date,
+                ):
+                    aggregate.missing_stop_count += counts.start_count - counts.stop_count
+        else:
+            has_any_start_or_stop = start_count > 0 or stop_count > 0
+            if has_any_start_or_stop:
                 if start_count < stop_count:
                     aggregate.missing_start_count += 1
                 if stop_count < start_count:
@@ -2957,7 +2951,11 @@ class DashboardUI:
             ).pack(anchor="w")
             return
 
-        aggregate = compute_aggregate_statistics(self.stats_by_aaid)
+        aggregate = compute_aggregate_statistics(
+            self.stats_by_aaid,
+            daily_counts_by_aaid=self.daily_counts_by_aaid,
+            reference_date=datetime.now().date(),
+        )
 
         # Render donut chart with legend + counts (dashboard style).
         width = max(self.graph_frame.winfo_width(), 260)
