@@ -663,6 +663,47 @@ def _to_local_naive_wall_clock(value: datetime) -> datetime:
     )
 
 
+def _system_now() -> datetime:
+    return datetime.now().astimezone().replace(tzinfo=None)
+
+
+def _message_event_time(received_time) -> Optional[datetime]:
+    return _normalize_for_comparison(_to_datetime(received_time))
+
+
+def _detect_system_outlook_time_mismatch(
+    messages: Iterable[tuple[str, object, Optional[str], str]],
+    now: Optional[datetime] = None,
+    future_tolerance_minutes: int = 5,
+) -> Optional[str]:
+    current_time = now or _system_now()
+    latest_event_time: Optional[datetime] = None
+
+    for message in messages:
+        try:
+            _subject, received_time, _sender_name, _body_text = _unpack_message(message)
+        except ValueError:
+            continue
+        event_time = _message_event_time(received_time)
+        latest_event_time = _latest(latest_event_time, event_time)
+
+    if latest_event_time is None:
+        return None
+
+    tolerance = timedelta(minutes=max(future_tolerance_minutes, 0))
+    if latest_event_time > current_time + tolerance:
+        delta = latest_event_time - current_time
+        drift_minutes = int(delta.total_seconds() // 60)
+        return (
+            "Outlook message time appears ahead of system time "
+            f"(latest email: {latest_event_time.strftime('%Y-%m-%d %H:%M:%S')}, "
+            f"system: {current_time.strftime('%Y-%m-%d %H:%M:%S')}, "
+            f"delta: {drift_minutes} min)."
+        )
+
+    return None
+
+
 def _to_datetime(received_time) -> Optional[datetime]:
     # Normalize aware timestamps to local wall-clock before dropping tzinfo so
     # day grouping stays aligned with Outlook's local date display.
@@ -787,7 +828,7 @@ def _is_in_progress_workday(
     counts: DailyNotificationCounts,
     reference_date: Optional[date] = None,
 ) -> bool:
-    current_date = reference_date or datetime.now().date()
+    current_date = reference_date or _system_now().date()
     current_date_key = current_date.strftime("%Y-%m-%d")
     return date_key == current_date_key and counts.start_count >= 1 and counts.stop_count == 0
 
@@ -983,7 +1024,7 @@ def parse_stats_from_messages(messages: Iterable[tuple[str, object]]) -> Dashboa
         if not subject:
             continue
 
-        event_time = _to_datetime(received_time)
+        event_time = _message_event_time(received_time)
         _apply_message_to_stats(stats, subject, event_time, sender_name)
 
     return stats
@@ -1017,7 +1058,7 @@ def parse_stats_by_aaid_from_messages(
         if sender_threat:
             _log_security_event(sender_threat, {"sender": sender_name})
 
-        event_time = _to_datetime(received_time)
+        event_time = _message_event_time(received_time)
         aaid = extract_aaid(subject)
         # DEBUG: Keep logs non-sensitive while still signaling parse activity.
         if debug_enabled:
@@ -1098,8 +1139,8 @@ def parse_stats_by_aaid_from_messages(
     sorted_for_timeline = sorted(
         message_list,
         key=lambda item: (
-            _normalize_for_comparison(_to_datetime(item[1])) is None,
-            _normalize_for_comparison(_to_datetime(item[1])) or datetime.min,
+            _message_event_time(item[1]) is None,
+            _message_event_time(item[1]) or datetime.min,
         ),
     )
 
@@ -1115,7 +1156,7 @@ def parse_stats_by_aaid_from_messages(
         if not subject:
             continue
 
-        event_time = _normalize_for_comparison(_to_datetime(received_time))
+        event_time = _message_event_time(received_time)
         if event_time is None:
             continue
 
@@ -1237,7 +1278,7 @@ def parse_daily_notification_counts_by_aaid(
         if not (is_start_event or is_stop_event):
             continue
 
-        event_time = _to_datetime(received_time)
+        event_time = _message_event_time(received_time)
         if not event_time:
             continue
 
@@ -1323,7 +1364,7 @@ def _parse_custom_date(date_text: str) -> datetime:
 
 
 def get_date_range(range_option: str, custom_start: str, custom_end: str, now: Optional[datetime] = None) -> tuple[Optional[datetime], Optional[datetime]]:
-    current = now or datetime.now()
+    current = now or _system_now()
     option = range_option.strip().lower()
 
     # Snap presets to whole-day boundaries using local system time.
@@ -1507,7 +1548,7 @@ def compute_missing_notification_trends(
         if not subject:
             continue
 
-        event_time = _to_datetime(received_time)
+        event_time = _message_event_time(received_time)
         if event_time is None:
             continue
 
@@ -1762,7 +1803,7 @@ def _read_messages_from_folder(
 
         matched_subject_count += 1
 
-        received_time = _to_datetime(getattr(item, "ReceivedTime", None))
+        received_time = _message_event_time(getattr(item, "ReceivedTime", None))
         normalized_received = _normalize_for_comparison(received_time)
 
         if normalized_end and normalized_received and normalized_received > normalized_end:
@@ -1971,7 +2012,7 @@ class DashboardUI:
         self.folder_path = tk.StringVar(value="Inbox")
         self.max_emails = tk.StringVar(value="100")
         self.subject_contains = tk.StringVar(value="")
-        self.range_option = tk.StringVar(value="Last 2 Months")
+        self.range_option = tk.StringVar(value="Last 3 Months")
         self.custom_start_date = tk.StringVar(value="")
         self.custom_end_date = tk.StringVar(value="")
         self.aaid_filter = tk.StringVar(value="")
@@ -2386,12 +2427,12 @@ class DashboardUI:
     def _on_range_option_changed(self, _selected=None):
         self._toggle_custom_dates()
         self._auto_adjust_max_emails()
-        self._update_stat_date_range_preview(now=datetime.now())
+        self._update_stat_date_range_preview(now=_system_now())
 
     def _on_custom_date_changed(self, _event=None):
         if self.range_option.get() == "Custom Range":
             self._auto_adjust_max_emails()
-        self._update_stat_date_range_preview(now=datetime.now())
+        self._update_stat_date_range_preview(now=_system_now())
 
     def _update_stat_date_range_preview(self, now: Optional[datetime] = None) -> None:
         try:
@@ -2955,7 +2996,7 @@ class DashboardUI:
         aggregate = compute_aggregate_statistics(
             self.stats_by_aaid,
             daily_counts_by_aaid=self.daily_counts_by_aaid,
-            reference_date=datetime.now().date(),
+            reference_date=_system_now().date(),
         )
 
         # Render donut chart with legend + counts (dashboard style).
@@ -3064,7 +3105,7 @@ class DashboardUI:
         aggregate = compute_aggregate_statistics(
             self.stats_by_aaid,
             daily_counts_by_aaid=self.daily_counts_by_aaid,
-            reference_date=(now or datetime.now()).date(),
+            reference_date=(now or _system_now()).date(),
         )
         self.stat_total_apps.set(str(aggregate.total_applications))
         self.stat_avg_techqa.set(format_duration(aggregate.avg_techqa_seconds))
@@ -3463,7 +3504,8 @@ class DashboardUI:
     def _refresh_worker(self, generation: int = 0):
         try:
             self._log_debug("Starting refresh worker.")
-            system_now = datetime.now()
+            system_now = _system_now()
+            clock_warning_text: Optional[str] = None
             filter_aaid = None
             aaid_filter_str = self.aaid_filter.get().strip()
             if aaid_filter_str:
@@ -3546,6 +3588,12 @@ class DashboardUI:
                 for msg in messages:
                     subject = msg[0] if msg else ""
                     self._log_debug(f"[MESSAGE_TO_PARSE] {_redact_subject(str(subject))}")
+                clock_warning_text = _detect_system_outlook_time_mismatch(
+                    messages,
+                    now=system_now,
+                )
+                if clock_warning_text:
+                    self._log_debug(clock_warning_text)
                 stats_by_aaid = parse_stats_by_aaid_from_messages(
                     messages,
                     filter_aaid=filter_aaid,
@@ -3593,9 +3641,10 @@ class DashboardUI:
                 else:
                     self.aaid_listbox.selection_set(0)
                     self.on_select_aaid()
-                    self.status_var.set(
-                        f"Found {len(self.aaid_keys)} AAID(s) from {len(messages)} message(s)."
-                    )
+                    status_text = f"Found {len(self.aaid_keys)} AAID(s) from {len(messages)} message(s)."
+                    if clock_warning_text:
+                        status_text += " Time mismatch warning detected; check system and Outlook clock settings."
+                    self.status_var.set(status_text)
                 self._end_refresh_state()
 
             if generation == self._refresh_generation:
