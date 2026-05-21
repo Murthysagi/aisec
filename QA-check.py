@@ -1976,7 +1976,7 @@ class DashboardUI:
         self.folder_path = tk.StringVar(value="Inbox")
         self.max_emails = tk.StringVar(value="100")
         self.subject_contains = tk.StringVar(value="")
-        self.range_option = tk.StringVar(value="Last 3 Months")
+        self.range_option = tk.StringVar(value="Last 2 Months")
         self.custom_start_date = tk.StringVar(value="")
         self.custom_end_date = tk.StringVar(value="")
         self.aaid_filter = tk.StringVar(value="")
@@ -2010,6 +2010,8 @@ class DashboardUI:
         self.aaid_page_info = tk.StringVar(value="Total: 0 | Page: 0/0")
         self.aaid_sort_mode = "start_desc"
         self._mailbox_init_in_progress = False
+        self._refresh_in_progress = False
+        self._mailbox_warning_shown_once = False
 
         self.status_var = tk.StringVar(value="Ready.")
         status_row = tk.Frame(self.root, bg=UI_BG)
@@ -2315,6 +2317,7 @@ class DashboardUI:
         if self._mailbox_init_in_progress:
             return
         self._mailbox_init_in_progress = True
+        self.status_label.configure(fg=UI_TEXT)
         self.status_var.set("Initializing Outlook mailboxes...")
         thread = threading.Thread(target=self._init_mailboxes_worker, daemon=True)
         thread.start()
@@ -2361,6 +2364,7 @@ class DashboardUI:
                 self.selected_mailbox.set("Default Mailbox")
                 self._refresh_mailbox_dropdown()
                 self._mailbox_init_in_progress = False
+                self.status_label.configure(fg=UI_TEXT)
                 self.status_var.set("")
                 messagebox.showerror("Outlook Not Found", "Outlook not found.")
 
@@ -2371,6 +2375,7 @@ class DashboardUI:
                 self.selected_mailbox.set("Default Mailbox")
                 self._refresh_mailbox_dropdown()
                 self._mailbox_init_in_progress = False
+                self.status_label.configure(fg=UI_TEXT)
                 self.status_var.set("Ready.")
 
             self.root.after(0, update_fallback_ui)
@@ -2602,7 +2607,8 @@ class DashboardUI:
 
         button_frame = tk.Frame(frame, bg=UI_BG)
         button_frame.grid(row=6, column=1, sticky="w", pady=4)
-        _new_button(button_frame, "Refresh", self.refresh, variant="primary").grid(row=0, column=0, padx=(0, 6))
+        self.refresh_btn = _new_button(button_frame, "Refresh", self.refresh, variant="primary")
+        self.refresh_btn.grid(row=0, column=0, padx=(0, 6))
         _new_button(button_frame, "Export to Excel", self.export_excel, variant="success").grid(row=0, column=1)
 
         results_frame = tk.Frame(frame, bg=UI_BG)
@@ -3406,16 +3412,52 @@ class DashboardUI:
             )
 
     def refresh(self):
+        if self._refresh_in_progress:
+            return
+
         # Initialize mailboxes asynchronously so the UI thread does not block.
-        if not self.mailbox_names or self.mailbox_names == ["Default Mailbox"]:
+        selected_mailbox = self.selected_mailbox.get().strip()
+        if not self.mailbox_names:
             self._init_mailboxes_async()
             return
+
+        if self.mailbox_names == ["Default Mailbox"] or selected_mailbox in {"", "Default Mailbox"}:
+            if not self._mailbox_warning_shown_once:
+                self.status_label.configure(fg="#c62828")
+                self.status_var.set("Select the correct mailbox before refresh.")
+                self._mailbox_warning_shown_once = True
+            return
+
+        self.status_label.configure(fg=UI_TEXT)
         self.status_var.set("Loading emails and parsing...")
         self.root.after(100, self._start_refresh_thread)
+
+    def _set_refresh_button_mode(self, show_cancel: bool) -> None:
+        if not hasattr(self, "refresh_btn"):
+            return
+        if show_cancel:
+            self.refresh_btn.configure(text="Cancel", command=self.cancel_refresh)
+        else:
+            self.refresh_btn.configure(text="Refresh", command=self.refresh)
+
+    def _end_refresh_state(self) -> None:
+        self._refresh_in_progress = False
+        self._set_refresh_button_mode(False)
+
+    def cancel_refresh(self) -> None:
+        if not self._refresh_in_progress:
+            return
+        # Invalidate current worker generation; stale results will be discarded.
+        self._refresh_generation += 1
+        self.status_label.configure(fg=UI_TEXT)
+        self.status_var.set("Refresh cancelled.")
+        self._end_refresh_state()
 
     def _start_refresh_thread(self):
         self._refresh_generation += 1
         generation = self._refresh_generation
+        self._refresh_in_progress = True
+        self._set_refresh_button_mode(True)
         thread = threading.Thread(target=self._refresh_worker, args=(generation,), daemon=True)
         thread.start()
 
@@ -3435,6 +3477,7 @@ class DashboardUI:
                 if len(filter_list) > 10:
                     self.root.after(0, lambda: messagebox.showerror("Too many AAIDs", "You can search for up to 10 AAIDs at a time."))
                     self.root.after(0, lambda: self.status_var.set(""))
+                    self.root.after(0, self._end_refresh_state)
                     return
                 filter_aaid = set(filter_list)
 
@@ -3451,6 +3494,7 @@ class DashboardUI:
                     ),
                 )
                 self.root.after(0, lambda: self.status_var.set(""))
+                self.root.after(0, self._end_refresh_state)
                 return
 
             subject_contains = self.subject_contains.get()
@@ -3473,6 +3517,7 @@ class DashboardUI:
                     "Use Last 1 Week/1/2/6 months or enter valid custom dates in YYYY-MM-DD format.",
                 ))
                 self.root.after(0, lambda: self.status_var.set(""))
+                self.root.after(0, self._end_refresh_state)
                 return
 
             try:
@@ -3512,6 +3557,7 @@ class DashboardUI:
             except OutlookNotFoundError:
                 self.root.after(0, lambda: self.status_var.set(""))
                 self.root.after(0, lambda: messagebox.showerror("Outlook Not Found", "Outlook not found."))
+                self.root.after(0, self._end_refresh_state)
                 return
             except Exception as exc:
                 self.root.after(0, lambda: self.status_var.set(""))
@@ -3525,6 +3571,7 @@ class DashboardUI:
                 import traceback
 
                 self._log_debug(f"Outlook Read Error: {exc}\n{traceback.format_exc()}")
+                self.root.after(0, self._end_refresh_state)
                 return
 
             def update_ui():
@@ -3550,6 +3597,7 @@ class DashboardUI:
                     self.status_var.set(
                         f"Found {len(self.aaid_keys)} AAID(s) from {len(messages)} message(s)."
                     )
+                self._end_refresh_state()
 
             if generation == self._refresh_generation:
                 self.root.after(0, update_ui)
@@ -3565,6 +3613,7 @@ class DashboardUI:
                 ),
             )
             self._log_debug(f"Thread Error: {exc}")
+            self.root.after(0, self._end_refresh_state)
 
     def _get_full_folder_path(self):
         mailbox = self.selected_mailbox.get().strip()
