@@ -409,6 +409,7 @@ class DailyNotificationCounts:
     start_times: list[datetime] = field(default_factory=list)
     stop_times: list[datetime] = field(default_factory=list)
     has_midnight_stop_entry: bool = False
+    carried_stop_source_dates: list[str] = field(default_factory=list)
 
 
 class OutlookFolderNotFoundError(Exception):
@@ -767,6 +768,23 @@ def _format_time_set(values: list[datetime]) -> str:
     return ", ".join(sorted({dt.strftime("%H:%M:%S") for dt in values}))
 
 
+def _format_carryover_dates(values: list[str]) -> str:
+    if not values:
+        return ""
+    unique_dates = sorted(set(values))
+    return f" [from {', '.join(unique_dates)}]"
+
+
+def _is_in_progress_workday(
+    date_key: str,
+    counts: DailyNotificationCounts,
+    reference_date: Optional[date] = None,
+) -> bool:
+    current_date = reference_date or datetime.now().date()
+    current_date_key = current_date.strftime("%Y-%m-%d")
+    return date_key == current_date_key and counts.start_count >= 1 and counts.stop_count == 0
+
+
 def _build_missing_notification_email_payload(
     aaid: str,
     tester_name: str,
@@ -780,15 +798,21 @@ def _build_missing_notification_email_payload(
     row_html: list[str] = []
     for date_key in sorted(daily_counts.keys(), reverse=True):
         counts = daily_counts[date_key]
-        is_alert = counts.start_count != 1 or counts.stop_count != 1
+        is_in_progress = _is_in_progress_workday(date_key, counts)
+        is_alert = (counts.start_count != 1 or counts.stop_count != 1) and not is_in_progress
         if counts.start_count == 0:
             missing_start_days += 1
-        if counts.stop_count == 0:
+        if counts.stop_count == 0 and not is_in_progress:
             missing_stop_days += 1
         if is_alert:
             alert_days += 1
 
-        status = "ALERT" if is_alert else "OK"
+        if is_in_progress:
+            status = "IN PROGRESS"
+        elif is_alert:
+            status = "ALERT"
+        else:
+            status = "OK"
         row_color = "#c62828" if is_alert else UI_TEXT
 
         start_display = str(counts.start_count)
@@ -805,7 +829,7 @@ def _build_missing_notification_email_payload(
             f"<td style='padding:6px 8px;border:1px solid #d9e2ec;color:{row_color};'>{html.escape(start_display)}</td>"
             f"<td style='padding:6px 8px;border:1px solid #d9e2ec;color:{row_color};'>{html.escape(_format_time_set(counts.start_times))}</td>"
             f"<td style='padding:6px 8px;border:1px solid #d9e2ec;color:{row_color};'>{html.escape(stop_display)}</td>"
-            f"<td style='padding:6px 8px;border:1px solid #d9e2ec;color:{row_color};'>{html.escape(_format_time_set(counts.stop_times))}</td>"
+            f"<td style='padding:6px 8px;border:1px solid #d9e2ec;color:{row_color};'>{html.escape(_format_time_set(counts.stop_times) + _format_carryover_dates(counts.carried_stop_source_dates))}</td>"
             f"<td style='padding:6px 8px;border:1px solid #d9e2ec;color:{row_color};font-weight:{'600' if is_alert else '400'};'>{status}</td>"
             "</tr>"
         )
@@ -1181,6 +1205,13 @@ def parse_daily_notification_counts_by_aaid(
     seen_daily_stop_presence: set[tuple[str, str]] = set()
     early_morning_stops: list[tuple[str, datetime]] = []
 
+    def _get_or_create_day_counts(target_aaid: str, target_date_key: str) -> DailyNotificationCounts:
+        if target_aaid not in daily_counts_by_aaid:
+            daily_counts_by_aaid[target_aaid] = {}
+        if target_date_key not in daily_counts_by_aaid[target_aaid]:
+            daily_counts_by_aaid[target_aaid][target_date_key] = DailyNotificationCounts()
+        return daily_counts_by_aaid[target_aaid][target_date_key]
+
     for message in messages:
         try:
             subject, received_time, sender_name, _body_text = _unpack_message(message)
@@ -1220,15 +1251,9 @@ def parse_daily_notification_counts_by_aaid(
 
         date_key = event_time.strftime("%Y-%m-%d")
 
-        if aaid not in daily_counts_by_aaid:
-            daily_counts_by_aaid[aaid] = {}
-        if date_key not in daily_counts_by_aaid[aaid]:
-            daily_counts_by_aaid[aaid][date_key] = DailyNotificationCounts()
-
-        day_counts = daily_counts_by_aaid[aaid][date_key]
-        day_bucket_key = (aaid, date_key)
-
         if is_bracket_start or (is_notification_type and is_start):
+            day_counts = _get_or_create_day_counts(aaid, date_key)
+            day_bucket_key = (aaid, date_key)
             day_counts.raw_start_count += 1
             day_counts.start_times.append(event_time)
             # Track the first start time
@@ -1237,7 +1262,16 @@ def parse_daily_notification_counts_by_aaid(
             if day_bucket_key not in seen_daily_start_presence:
                 seen_daily_start_presence.add(day_bucket_key)
                 day_counts.start_count += 1
+
         if is_bracket_stop or (is_notification_type and is_stop):
+            # Defer early-morning STOP assignment until after all messages are
+            # parsed so carryover remains correct even if messages are unsorted.
+            if event_time.hour < EARLY_STOP_CARRYOVER_CUTOFF_HOUR:
+                early_morning_stops.append((aaid, event_time))
+                continue
+
+            day_counts = _get_or_create_day_counts(aaid, date_key)
+            day_bucket_key = (aaid, date_key)
             day_counts.raw_stop_count += 1
             day_counts.stop_times.append(event_time)
             # Track the last stop time
@@ -1247,28 +1281,35 @@ def parse_daily_notification_counts_by_aaid(
                 seen_daily_stop_presence.add(day_bucket_key)
                 day_counts.stop_count += 1
 
-            # Treat STOPs that arrive shortly after midnight as completion for
-            # the previous day when that day has START but no STOP yet. Keep
-            # the current-day row untouched so it still appears as an alert row.
-            if event_time.hour < EARLY_STOP_CARRYOVER_CUTOFF_HOUR:
-                day_counts.has_midnight_stop_entry = True
-                early_morning_stops.append((aaid, event_time))
-
     for aaid, stop_time in sorted(early_morning_stops, key=lambda item: item[1]):
+        actual_date_key = stop_time.strftime("%Y-%m-%d")
         previous_date_key = (stop_time - timedelta(days=1)).strftime("%Y-%m-%d")
         counts_by_day = daily_counts_by_aaid.get(aaid)
-        if not counts_by_day:
-            continue
-        previous_counts = counts_by_day.get(previous_date_key)
-        if previous_counts is None:
-            continue
-        if previous_counts.start_count < 1 or previous_counts.stop_count != 0:
+        previous_counts = counts_by_day.get(previous_date_key) if counts_by_day else None
+        carried_to_previous_day = (
+            previous_counts is not None
+            and previous_counts.start_count >= 1
+            and previous_counts.stop_count == 0
+        )
+
+        if carried_to_previous_day:
+            previous_counts.stop_count = 1
+            previous_counts.stop_times.append(stop_time)
+            previous_counts.carried_stop_source_dates.append(actual_date_key)
+            if previous_counts.stop_time is None or stop_time > previous_counts.stop_time:
+                previous_counts.stop_time = stop_time
             continue
 
-        previous_counts.stop_count = 1
-        previous_counts.stop_times.append(stop_time)
-        if previous_counts.stop_time is None or stop_time > previous_counts.stop_time:
-            previous_counts.stop_time = stop_time
+        actual_counts = _get_or_create_day_counts(aaid, actual_date_key)
+        day_bucket_key = (aaid, actual_date_key)
+        actual_counts.raw_stop_count += 1
+        actual_counts.stop_times.append(stop_time)
+        actual_counts.has_midnight_stop_entry = True
+        if actual_counts.stop_time is None or stop_time > actual_counts.stop_time:
+            actual_counts.stop_time = stop_time
+        if day_bucket_key not in seen_daily_stop_presence:
+            seen_daily_stop_presence.add(day_bucket_key)
+            actual_counts.stop_count += 1
 
     return daily_counts_by_aaid
 
@@ -1354,6 +1395,22 @@ class AggregateStatistics:
     totalqa_sample_size: int = 0
 
 
+def _compute_actionable_imbalance_flags(
+    daily_counts: dict[str, DailyNotificationCounts],
+    reference_date: Optional[date] = None,
+) -> tuple[bool, bool]:
+    has_missing_start = False
+    has_missing_stop = False
+
+    for date_key, counts in daily_counts.items():
+        if counts.start_count < counts.stop_count:
+            has_missing_start = True
+        if counts.stop_count < counts.start_count and not _is_in_progress_workday(date_key, counts, reference_date):
+            has_missing_stop = True
+
+    return has_missing_start, has_missing_stop
+
+
 @dataclass
 class TrendStatistics:
     older_missing_start: int = 0
@@ -1365,7 +1422,11 @@ class TrendStatistics:
     has_comparison: bool = False
 
 
-def compute_aggregate_statistics(stats_by_aaid: dict[str, DashboardStats]) -> AggregateStatistics:
+def compute_aggregate_statistics(
+    stats_by_aaid: dict[str, DashboardStats],
+    daily_counts_by_aaid: Optional[dict[str, dict[str, DailyNotificationCounts]]] = None,
+    reference_date: Optional[date] = None,
+) -> AggregateStatistics:
     aggregate = AggregateStatistics()
     aggregate.total_applications = len(stats_by_aaid)
 
@@ -1373,7 +1434,7 @@ def compute_aggregate_statistics(stats_by_aaid: dict[str, DashboardStats]) -> Ag
     finalqa_durations: list[float] = []
     totalqa_durations: list[float] = []
 
-    for stats in stats_by_aaid.values():
+    for aaid, stats in stats_by_aaid.items():
         if stats.techqa_start and stats.techqa_stop and stats.techqa_stop >= stats.techqa_start:
             techqa_durations.append((stats.techqa_stop - stats.techqa_start).total_seconds())
         if stats.finalqa_start and stats.finalqa_stop and stats.finalqa_stop >= stats.finalqa_start:
@@ -1391,15 +1452,26 @@ def compute_aggregate_statistics(stats_by_aaid: dict[str, DashboardStats]) -> Ag
                 + (stats.finalqa_stop - stats.finalqa_start).total_seconds()
             )
         # Only count AAIDs that have at least one START or STOP notification (exclude QA-only).
-        # Treat imbalanced Start/Stop totals as missing on the lower side.
+        # Treat today's START-without-STOP as in-progress until workday ends.
         start_count = stats.start_notifications_count
         stop_count = stats.stop_notifications_count
         has_any_start_or_stop = start_count > 0 or stop_count > 0
         if has_any_start_or_stop:
-            if start_count < stop_count:
-                aggregate.missing_start_count += 1
-            if stop_count < start_count:
-                aggregate.missing_stop_count += 1
+            if daily_counts_by_aaid is not None:
+                daily_counts = daily_counts_by_aaid.get(aaid, {})
+                has_missing_start, has_missing_stop = _compute_actionable_imbalance_flags(
+                    daily_counts,
+                    reference_date=reference_date,
+                )
+                if has_missing_start:
+                    aggregate.missing_start_count += 1
+                if has_missing_stop:
+                    aggregate.missing_stop_count += 1
+            else:
+                if start_count < stop_count:
+                    aggregate.missing_start_count += 1
+                if stop_count < start_count:
+                    aggregate.missing_stop_count += 1
 
     if techqa_durations:
         aggregate.avg_techqa_seconds = sum(techqa_durations) / len(techqa_durations)
@@ -1882,6 +1954,13 @@ class DashboardUI:
     def _matches_notification_filter(self, stats: DashboardStats) -> bool:
         # Always show all apps (filter removed from UI)
         return True
+
+    def _has_actionable_imbalance(self, aaid: str, stats: DashboardStats) -> bool:
+        daily_counts = self.daily_counts_by_aaid.get(aaid, {})
+        if not daily_counts:
+            return stats.start_notifications_count != stats.stop_notifications_count
+        has_missing_start, has_missing_stop = _compute_actionable_imbalance_flags(daily_counts)
+        return has_missing_start or has_missing_stop
 
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -2977,7 +3056,11 @@ class DashboardUI:
         end_date: Optional[datetime] = None,
         now: Optional[datetime] = None,
     ) -> None:
-        aggregate = compute_aggregate_statistics(self.stats_by_aaid)
+        aggregate = compute_aggregate_statistics(
+            self.stats_by_aaid,
+            daily_counts_by_aaid=self.daily_counts_by_aaid,
+            reference_date=(now or datetime.now()).date(),
+        )
         self.stat_total_apps.set(str(aggregate.total_applications))
         self.stat_avg_techqa.set(format_duration(aggregate.avg_techqa_seconds))
         self.stat_avg_finalqa.set(format_duration(aggregate.avg_finalqa_seconds))
@@ -3220,7 +3303,7 @@ class DashboardUI:
 
             # Highlight AAIDs with any Start/Stop imbalance.
             row_index = self.aaid_listbox.size() - 1
-            if item_stats.start_notifications_count != item_stats.stop_notifications_count:
+            if self._has_actionable_imbalance(key, item_stats):
                 self.aaid_listbox.itemconfig(row_index, fg="#c62828")
 
     def on_select_aaid(self, _event=None):
@@ -3259,8 +3342,11 @@ class DashboardUI:
         for date_key in sorted_dates:
             counts = daily_counts[date_key]
             # Daily notifications are valid only when there is exactly 1 start and 1 stop.
-            is_alert = counts.start_count != 1 or counts.stop_count != 1
-            if is_alert:
+            is_in_progress = _is_in_progress_workday(date_key, counts)
+            is_alert = (counts.start_count != 1 or counts.stop_count != 1) and not is_in_progress
+            if is_in_progress:
+                status = "IN PROGRESS"
+            elif is_alert:
                 status = "ALERT"
             elif counts.raw_start_count > 1:
                 status = "MULTIPLE START"
@@ -3288,6 +3374,7 @@ class DashboardUI:
                 stop_time_str = ", ".join(sorted({dt.strftime("%H:%M:%S") for dt in counts.stop_times}))
             else:
                 stop_time_str = "N/A"
+            stop_time_str += _format_carryover_dates(counts.carried_stop_source_dates)
             row_text = f"{date_key} | Start: {start_text} @ {start_time_str} | Stop: {stop_text} @ {stop_time_str} | {status}"
             self.daily_listbox.insert(tk.END, row_text)
             row_index = self.daily_listbox.size() - 1
