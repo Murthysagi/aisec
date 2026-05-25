@@ -52,6 +52,7 @@ LOG_EXT = ".log"
 SECURITY_LOG_BASENAME = "outlook_qa_dashboard_security"
 DEV_LOG_BASENAME = "outlook_qa_dashboard_dev"
 DEV_LOG_SESSION_STAMP = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+SECURITY_LOG_SESSION_STAMP = DEV_LOG_SESSION_STAMP
 LOG_MAX_SIZE = 1 * 1024 * 1024  # 1 MB
 LOG_RETENTION_DAYS = 7
 
@@ -92,7 +93,8 @@ def _current_log_path() -> str:
 
 
 def _current_security_log_path() -> str:
-    return os.path.join(LOG_DIR, f"{SECURITY_LOG_BASENAME}{LOG_EXT}")
+    # Use a per-run timestamped file so security events are isolated per session.
+    return os.path.join(LOG_DIR, f"{SECURITY_LOG_BASENAME}_{SECURITY_LOG_SESSION_STAMP}{LOG_EXT}")
 
 def _current_dev_log_path() -> str:
     # In DEV_MODE, use a per-run timestamped file so logs do not append
@@ -686,14 +688,18 @@ def _is_notification_start_event(subject_text: str) -> bool:
     is_start = _is_start(subject_text)
     is_bracket_start = "[START]" in subject_text.upper()
     is_notification_type = _is_notification(subject_text)
-    return is_bracket_start or (is_notification_type and is_start)
+    has_pentest_marker = "[PENTEST]" in subject_text.upper() or bool(re.search(r"\bpentest\b", subject_text, re.IGNORECASE))
+    # Avoid false positives from generic non-testing email text.
+    return is_bracket_start or (has_pentest_marker and is_notification_type and is_start)
 
 
 def _is_notification_stop_event(subject_text: str) -> bool:
     is_stop = _is_stop(subject_text)
     is_bracket_stop = "[STOP]" in subject_text.upper()
     is_notification_type = _is_notification(subject_text)
-    return is_bracket_stop or (is_notification_type and is_stop)
+    has_pentest_marker = "[PENTEST]" in subject_text.upper() or bool(re.search(r"\bpentest\b", subject_text, re.IGNORECASE))
+    # Avoid false positives from generic non-testing email text.
+    return is_bracket_stop or (has_pentest_marker and is_notification_type and is_stop)
 
 
 def _to_local_naive_wall_clock(value: datetime) -> datetime:
@@ -1120,6 +1126,8 @@ def parse_stats_by_aaid_from_messages(
     start_notifications_by_aaid: dict[str, list[tuple[Optional[datetime], Optional[str]]]] = {}
     unique_start_day_by_aaid: dict[str, set[str]] = {}
     unique_stop_day_by_aaid: dict[str, set[str]] = {}
+    finalqa_start_candidates_by_aaid: dict[str, list[datetime]] = {}
+    finalqa_event_times_by_aaid: dict[str, list[datetime]] = {}
 
     # First pass: collect stats and track start notifications
     for msg in message_list:
@@ -1300,10 +1308,43 @@ def parse_stats_by_aaid_from_messages(
             and sender_name is not None
             and tester_name is not None
             and sender_name != tester_name
+            and (stats.techqa_start is None or event_time > stats.techqa_start)
+            and (stats.techqa_stop is None or event_time > stats.techqa_stop)
         ):
             stats.finalqa_start = event_time
 
-    for stats in stats_by_aaid.values():
+        if _is_finalqa(subject):
+            if event_time is not None:
+                finalqa_event_times_by_aaid.setdefault(aaid, []).append(event_time)
+            if (
+                event_time is not None
+                and sender_name is not None
+                and tester_name is not None
+                and sender_name != tester_name
+            ):
+                finalqa_start_candidates_by_aaid.setdefault(aaid, []).append(event_time)
+
+    for aaid, stats in stats_by_aaid.items():
+        # Final QA must start/end after TechQA start and TechQA end when those
+        # milestones are available.
+        start_candidates = finalqa_start_candidates_by_aaid.get(aaid, [])
+        all_finalqa_events = finalqa_event_times_by_aaid.get(aaid, [])
+
+        def _is_after_techqa(candidate_time: datetime) -> bool:
+            if stats.techqa_start and candidate_time <= stats.techqa_start:
+                return False
+            if stats.techqa_stop and candidate_time <= stats.techqa_stop:
+                return False
+            return True
+
+        eligible_start_candidates = [t for t in start_candidates if _is_after_techqa(t)]
+        stats.finalqa_start = min(eligible_start_candidates) if eligible_start_candidates else None
+
+        eligible_end_candidates = [t for t in all_finalqa_events if _is_after_techqa(t)]
+        if stats.finalqa_start is not None:
+            eligible_end_candidates = [t for t in eligible_end_candidates if t >= stats.finalqa_start]
+        stats.finalqa_stop = max(eligible_end_candidates) if eligible_end_candidates else None
+
         if stats.first_start_notification_at and stats.last_stop_notification_at:
             stats.completion_days_count = count_days_inclusive(
                 stats.first_start_notification_at.date(),
@@ -1321,6 +1362,7 @@ def parse_stats_by_aaid_from_messages(
 def parse_daily_notification_counts_by_aaid(
     messages: Iterable[tuple[str, object]],
     filter_aaid: Optional[set[str]] = None,
+    debug_enabled: bool = False,
 ) -> dict[str, dict[str, DailyNotificationCounts]]:
     daily_counts_by_aaid: dict[str, dict[str, DailyNotificationCounts]] = {}
     seen_daily_start_presence: set[tuple[str, str]] = set()
@@ -1337,8 +1379,16 @@ def parse_daily_notification_counts_by_aaid(
         try:
             subject, received_time, sender_name, body_text = _unpack_message(message)
         except ValueError:
+            if debug_enabled:
+                _append_debug_log_line(
+                    f"[{datetime.now().isoformat()}] [DAILY_PARSE_SKIP] reason=invalid_message_shape"
+                )
             continue
         if not subject and not body_text:
+            if debug_enabled:
+                _append_debug_log_line(
+                    f"[{datetime.now().isoformat()}] [DAILY_PARSE_SKIP] reason=empty_subject_and_body"
+                )
             continue
 
         message_text = _combine_message_text(subject, body_text)
@@ -1348,24 +1398,44 @@ def parse_daily_notification_counts_by_aaid(
         # valid notification messages).
         subject_lowered = (subject or "").lower()
         if "automatic reply" in subject_lowered or "autoreply" in subject_lowered or "auto-reply" in subject_lowered:
+            if debug_enabled:
+                _append_debug_log_line(
+                    f"[{datetime.now().isoformat()}] [DAILY_PARSE_SKIP] reason=auto_reply subject={_format_subject_for_logging(subject)}"
+                )
             continue
 
         is_start_event = _is_notification_start_event(message_text)
         is_stop_event = _is_notification_stop_event(message_text)
         if not (is_start_event or is_stop_event):
+            if debug_enabled:
+                _append_debug_log_line(
+                    f"[{datetime.now().isoformat()}] [DAILY_PARSE_SKIP] reason=no_start_or_stop event_time={_safe_log_text(received_time)} subject={_format_subject_for_logging(subject)}"
+                )
             continue
 
         event_time = _message_event_time(received_time)
         if not event_time:
+            if debug_enabled:
+                _append_debug_log_line(
+                    f"[{datetime.now().isoformat()}] [DAILY_PARSE_SKIP] reason=invalid_event_time raw_received={_safe_log_text(received_time)} subject={_format_subject_for_logging(subject)}"
+                )
             continue
 
         aaid = _extract_aaid_from_message(subject, body_text)
 
         # Filter by AAID if specified
         if filter_aaid is not None and aaid not in filter_aaid:
+            if debug_enabled:
+                _append_debug_log_line(
+                    f"[{datetime.now().isoformat()}] [DAILY_PARSE_SKIP] reason=aaid_filtered aaid={aaid} event_time={event_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
             continue
 
         date_key = event_time.strftime("%Y-%m-%d")
+        if debug_enabled:
+            _append_debug_log_line(
+                f"[{datetime.now().isoformat()}] [DAILY_PARSE_EVENT] aaid={aaid} date_key={date_key} is_start={is_start_event} is_stop={is_stop_event} event_time={event_time.strftime('%Y-%m-%d %H:%M:%S')} sender={_safe_log_text(sender_name or 'N/A')} subject={_format_subject_for_logging(subject)}"
+            )
 
         if is_start_event:
             day_counts = _get_or_create_day_counts(aaid, date_key)
@@ -1392,6 +1462,17 @@ def parse_daily_notification_counts_by_aaid(
             if day_bucket_key not in seen_daily_stop_presence:
                 seen_daily_stop_presence.add(day_bucket_key)
                 day_counts.stop_count += 1
+
+    if debug_enabled:
+        _append_debug_log_line(
+            f"[{datetime.now().isoformat()}] [DAILY_PARSE_SUMMARY] unique_aaid_count={len(daily_counts_by_aaid)}"
+        )
+        for aaid in sorted(daily_counts_by_aaid.keys()):
+            for date_key in sorted(daily_counts_by_aaid[aaid].keys()):
+                counts = daily_counts_by_aaid[aaid][date_key]
+                _append_debug_log_line(
+                    f"[{datetime.now().isoformat()}] [DAILY_PARSE_DAY] aaid={aaid} date_key={date_key} start_count={counts.start_count} raw_start_count={counts.raw_start_count} stop_count={counts.stop_count} raw_stop_count={counts.raw_stop_count}"
+                )
 
     return daily_counts_by_aaid
 
@@ -1860,11 +1941,19 @@ def _read_messages_from_folder(
         # Match notification/QA keywords from subject and body so entries are
         # still captured when Outlook subject lines are generic.
         if not pentest_event_re.search(message_text):
+            if debug_enabled:
+                _append_debug_log_line(
+                    f"[{datetime.now().isoformat()}] [READ_SKIP] reason=no_pentest_keyword { _format_subject_for_logging(subject) }"
+                )
             continue
 
         # If custom keywords provided, require at least one keyword in subject/body.
         if keywords and not any(kw in message_text.lower() for kw in keywords):
             skipped_by_filter_count += 1
+            if debug_enabled:
+                _append_debug_log_line(
+                    f"[{datetime.now().isoformat()}] [READ_SKIP] reason=keyword_filter keywords={_safe_log_text(keywords)} { _format_subject_for_logging(subject) }"
+                )
             continue
 
         matched_subject_count += 1
@@ -1874,10 +1963,18 @@ def _read_messages_from_folder(
 
         if normalized_end and normalized_received and normalized_received > normalized_end:
             skipped_by_date_count += 1
+            if debug_enabled:
+                _append_debug_log_line(
+                    f"[{datetime.now().isoformat()}] [READ_SKIP] reason=after_end normalized_received={normalized_received.strftime('%Y-%m-%d %H:%M:%S')} normalized_end={normalized_end.strftime('%Y-%m-%d %H:%M:%S')} { _format_subject_for_logging(subject) }"
+                )
             continue
         if normalized_start and normalized_received and normalized_received < normalized_start:
             # Items are sorted by newest first, so we can stop once we pass lower bound.
             skipped_by_date_count += 1
+            if debug_enabled:
+                _append_debug_log_line(
+                    f"[{datetime.now().isoformat()}] [READ_BREAK] reason=before_start normalized_received={normalized_received.strftime('%Y-%m-%d %H:%M:%S')} normalized_start={normalized_start.strftime('%Y-%m-%d %H:%M:%S')} { _format_subject_for_logging(subject) }"
+                )
             break
 
         results.append(
@@ -1888,6 +1985,10 @@ def _read_messages_from_folder(
                 body_text,
             )
         )
+        if debug_enabled:
+            _append_debug_log_line(
+                f"[{datetime.now().isoformat()}] [READ_KEEP] received={_safe_log_text(normalized_received or received_time)} sender={_safe_log_text(_get_sender_name(item) or 'N/A')} { _format_subject_for_logging(subject) }"
+            )
         count += 1
         if count >= max_emails:
             break
@@ -2762,7 +2863,20 @@ class DashboardUI:
 
         # Try to use tkcalendar.DateEntry for date picking, fallback to Entry if unavailable
         try:
-            from tkcalendar import DateEntry
+            with warnings.catch_warnings():
+                # Suppress noisy third-party SyntaxWarning from tkcalendar source
+                # (invalid escape sequence in packaged module code).
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r".*invalid escape sequence.*",
+                    category=SyntaxWarning,
+                )
+                warnings.filterwarnings(
+                    "ignore",
+                    category=SyntaxWarning,
+                    module=r"tkcalendar(\.|$)",
+                )
+                from tkcalendar import DateEntry
             self.custom_start_entry = DateEntry(
                 self.custom_dates_row,
                 textvariable=self.custom_start_date,
@@ -2806,7 +2920,6 @@ class DashboardUI:
         self.refresh_btn = _new_button(button_frame, "Refresh", self.refresh, variant="primary")
         self.refresh_btn.grid(row=0, column=0, padx=(0, 6))
         _new_button(button_frame, "Export to Excel", self.export_excel, variant="success").grid(row=0, column=1, padx=(0, 6))
-        _new_button(button_frame, "Exit", self._exit_app, variant="danger").grid(row=0, column=2)
 
         results_frame = tk.Frame(frame, bg=UI_BG)
         results_frame.grid(row=7, column=0, columnspan=5, sticky="nsew", pady=(0, 6))
@@ -3407,6 +3520,18 @@ class DashboardUI:
             key
             for key, stats in self.stats_by_aaid.items()
             if self._matches_notification_filter(stats)
+            and not (
+                key == "UNKNOWN"
+                and stats.start_notifications_count == 0
+                and stats.stop_notifications_count == 0
+                and stats.first_start_notification_at is None
+                and stats.last_stop_notification_at is None
+                and stats.techqa_start is None
+                and stats.techqa_stop is None
+                and stats.finalqa_start is None
+                and stats.finalqa_stop is None
+                and stats.techqa_milestone_at is None
+            )
         ]
 
         def group_key(aaid_key: str) -> int:
@@ -3761,7 +3886,11 @@ class DashboardUI:
                     filter_aaid=filter_aaid,
                     debug_enabled=debug_enabled,
                 )
-                daily_counts_by_aaid = parse_daily_notification_counts_by_aaid(messages, filter_aaid=filter_aaid)
+                daily_counts_by_aaid = parse_daily_notification_counts_by_aaid(
+                    messages,
+                    filter_aaid=filter_aaid,
+                    debug_enabled=debug_enabled,
+                )
                 trend_stats = compute_missing_notification_trends(messages, filter_aaid=filter_aaid)
             except OutlookNotFoundError:
                 self.root.after(0, lambda: self.status_var.set(""))
