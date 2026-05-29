@@ -712,21 +712,17 @@ def _strip_prefixes(subject: str) -> str:
 
 
 def _is_notification_start_event(subject_text: str) -> bool:
-    is_start = _is_start(subject_text)
-    is_bracket_start = "[START]" in subject_text.upper()
-    is_notification_type = _is_notification(subject_text)
-    has_pentest_marker = "[PENTEST]" in subject_text.upper() or bool(re.search(r"\bpentest\b", subject_text, re.IGNORECASE))
-    # Avoid false positives from generic non-testing email text.
-    return is_bracket_start or (has_pentest_marker and is_notification_type and is_start)
+    # Strict rule: notification start is valid only when subject contains [START].
+    # Callers may pass subject+body combined text, so evaluate only the first line.
+    subject_line = (subject_text or "").splitlines()[0]
+    return "[START]" in subject_line.upper()
 
 
 def _is_notification_stop_event(subject_text: str) -> bool:
-    is_stop = _is_stop(subject_text)
-    is_bracket_stop = "[STOP]" in subject_text.upper()
-    is_notification_type = _is_notification(subject_text)
-    has_pentest_marker = "[PENTEST]" in subject_text.upper() or bool(re.search(r"\bpentest\b", subject_text, re.IGNORECASE))
-    # Avoid false positives from generic non-testing email text.
-    return is_bracket_stop or (has_pentest_marker and is_notification_type and is_stop)
+    # Strict rule: notification stop is valid only when subject contains [STOP].
+    # Callers may pass subject+body combined text, so evaluate only the first line.
+    subject_line = (subject_text or "").splitlines()[0]
+    return "[STOP]" in subject_line.upper()
 
 
 def _to_local_naive_wall_clock(value: datetime) -> datetime:
