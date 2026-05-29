@@ -66,6 +66,7 @@ def _env_flag(name: str, default: bool) -> bool:
 
 SAFE_MODE = _env_flag("OUTLOOK_QA_SAFE_MODE", True)
 DEV_MODE = _env_flag("OUTLOOK_QA_DEV_MODE", False)
+SYSTEM_LOGGING_ENABLED = _env_flag("OUTLOOK_QA_ENABLE_SYSTEM_LOGGING", False)
 FEEDBACK_TARGET_URL = os.environ.get(
     "OUTLOOK_QA_FEEDBACK_URL",
     "https://github.com/",
@@ -132,7 +133,7 @@ def _append_debug_log_line(line: str) -> None:
 
 def _append_dev_log_line(line: str) -> None:
     """Append to dev log file with unredacted details."""
-    if not DEV_MODE:
+    if not SYSTEM_LOGGING_ENABLED or not DEV_MODE:
         return
     try:
         os.makedirs(LOG_DIR, exist_ok=True)
@@ -275,6 +276,8 @@ def delete_old_logs():
                 pass
 
 def setup_logging():
+    if not SYSTEM_LOGGING_ENABLED:
+        return
     os.makedirs(LOG_DIR, exist_ok=True)
     # In DEV_MODE, send the root logger output to the dev log only.
     log_path = _current_dev_log_path() if DEV_MODE else _current_log_path()
@@ -290,6 +293,8 @@ def setup_logging():
 
 def setup_security_logging():
     """Setup separate security logger for pentest/attack detection."""
+    if not SYSTEM_LOGGING_ENABLED:
+        return None
     os.makedirs(LOG_DIR, exist_ok=True)
     sec_log_path = _current_security_log_path()
     rotate_log_if_needed(sec_log_path)
@@ -310,7 +315,7 @@ def setup_security_logging():
 
 def setup_dev_logging():
     """Setup dev mode logger for detailed unredacted debugging."""
-    if not DEV_MODE:
+    if not SYSTEM_LOGGING_ENABLED or not DEV_MODE:
         return None
     
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -364,6 +369,7 @@ ALL_MAILBOXES_OPTION = "All Mailboxes"
 RUNTIME_DEPENDENCIES: list[tuple[str, str]] = [
     ("pywin32", "win32com"),
     ("openpyxl", "openpyxl"),
+    ("tkcalendar", "tkcalendar"),
 ]
 
 
@@ -408,9 +414,12 @@ def _detect_pentest_attempt(text: str, field_name: str = "input") -> Optional[st
 
 def _log_security_event(threat: str, context: dict = None) -> None:
     """Log security event to separate security log file."""
+    if not SYSTEM_LOGGING_ENABLED:
+        return
     context_str = " | ".join(f"{k}={v}" for k, v in (context or {}).items())
     log_msg = f"{threat}" + (f" | {context_str}" if context_str else "")
-    SECURITY_LOGGER.warning(log_msg)
+    if SECURITY_LOGGER is not None:
+        SECURITY_LOGGER.warning(log_msg)
     logging.info(f"[SECURITY] {log_msg}")  # Also log to main log
 
 
@@ -1178,6 +1187,13 @@ def parse_stats_by_aaid_from_messages(
         # Filter by AAID if specified
         if filter_aaid is not None and aaid not in filter_aaid:
             continue
+
+        is_start_event = _is_notification_start_event(message_text)
+        is_stop_event = _is_notification_stop_event(message_text)
+        # Only track AAIDs that have at least one true start/stop notification.
+        if not (is_start_event or is_stop_event):
+            continue
+
         if aaid not in stats_by_aaid:
             stats_by_aaid[aaid] = DashboardStats()
 
@@ -1193,9 +1209,6 @@ def parse_stats_by_aaid_from_messages(
         subject_lowered = (subject or "").lower()
         if "automatic reply" in subject_lowered or "autoreply" in subject_lowered or "auto-reply" in subject_lowered:
             continue
-
-        is_start_event = _is_notification_start_event(message_text)
-        is_stop_event = _is_notification_stop_event(message_text)
 
         if event_time is not None:
             date_key = event_time.strftime("%Y-%m-%d")
