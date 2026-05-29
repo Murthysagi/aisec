@@ -470,12 +470,22 @@ def _ensure_runtime_dependencies() -> None:
     if not missing_packages:
         return
 
-    package_list = ", ".join(missing_packages)
-    raise RuntimeError(
-        "Missing required Python packages: "
-        f"{package_list}. Install them before running: "
-        f"{sys.executable} -m pip install {' '.join(missing_packages)}"
-    )
+    # Build a detailed, user-friendly error message
+    install_command = f"python -m pip install {' '.join(missing_packages)}"
+    
+    error_message = "Missing Required Python Packages\n"
+    error_message += "=" * 50 + "\n\n"
+    error_message += "The following packages need to be installed:\n\n"
+    
+    for i, package in enumerate(missing_packages, 1):
+        error_message += f"  {i}. {package}\n"
+    
+    error_message += f"\n{'=' * 50}\n"
+    error_message += f"Installation Command:\n\n"
+    error_message += f"  {install_command}\n\n"
+    error_message += "Please run this command in your terminal and try again."
+    
+    raise RuntimeError(error_message)
 
 
 def _find_outlook_executable() -> Optional[str]:
@@ -3978,9 +3988,10 @@ def main():
         except Exception as dependency_exc:  # noqa: BLE001
             root = tk.Tk()
             root.withdraw()
+            # Display dependency error with clear package and command information
             messagebox.showerror(
-                "Dependency Error",
-                _user_error_message("Required Python packages are missing.", dependency_exc),
+                "Missing Python Packages",
+                str(dependency_exc),
             )
             root.destroy()
             return
