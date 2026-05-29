@@ -353,6 +353,14 @@ FINAL_QA_RE = re.compile(r"\bfinal\s*qa\b|\bfinalqa\b", re.IGNORECASE)
 NOTIFICATION_RE = re.compile(r"\bnotifications?\b", re.IGNORECASE)
 COMPLETED_RE = re.compile(r"\b(complet(?:e|ed)|done|closed?)\b", re.IGNORECASE)
 PROCEED_FINAL_QA_RE = re.compile(r"\bproceed\b.*\bfinal\s*qa\b|\bfinal\s*qa\b.*\bproceed\b", re.IGNORECASE)
+TECHQA_PICKUP_RE = re.compile(
+    r"\b(i\s*(am|'m)\s*(working|taking)\s*on\s*(it|this)|"
+    r"i\s*(will|'ll)\s*(pick|take)\s*(it|this)|"
+    r"i\s*can\s*(pick|take)\s*(it|this)|"
+    r"i\s*am\s*on\s*it|"
+    r"picking\s*(it|this)\s*up)\b",
+    re.IGNORECASE,
+)
 AAID_PATTERNS = [
     re.compile(r"\bAAID\s*[:=-]\s*(AA\d+)\b", re.IGNORECASE),
     re.compile(r"\bAAID\s+(AA\d+)\b", re.IGNORECASE),
@@ -835,6 +843,48 @@ def _same_person(left: Optional[str], right: Optional[str]) -> bool:
     return _sender_dedupe_key(left) == _sender_dedupe_key(right)
 
 
+def _select_tester_from_start_notifications(
+    start_notifications: list[tuple[Optional[datetime], Optional[str]]],
+) -> Optional[str]:
+    """Pick tester as the dominant sender across start notifications.
+
+    Tie-breakers:
+    1) Most start notifications sent
+    2) Earliest start-notification timestamp
+    3) Alphabetical sender key for deterministic selection
+    """
+    sender_counts: dict[str, int] = {}
+    sender_first_time: dict[str, Optional[datetime]] = {}
+    sender_display_name: dict[str, str] = {}
+
+    for event_time, sender_name in start_notifications:
+        normalized_sender = _normalize_sender_name(sender_name)
+        if not normalized_sender:
+            continue
+
+        sender_key = _sender_dedupe_key(normalized_sender)
+        sender_counts[sender_key] = sender_counts.get(sender_key, 0) + 1
+        sender_display_name.setdefault(sender_key, normalized_sender)
+
+        previous_time = sender_first_time.get(sender_key)
+        if previous_time is None or (event_time is not None and event_time < previous_time):
+            sender_first_time[sender_key] = event_time
+
+    if not sender_counts:
+        return None
+
+    ranked_senders = sorted(
+        sender_counts.keys(),
+        key=lambda key: (
+            -sender_counts[key],
+            sender_first_time.get(key) is None,
+            sender_first_time.get(key) or datetime.max,
+            key,
+        ),
+    )
+    return sender_display_name.get(ranked_senders[0])
+
+
 def _unpack_message(message) -> tuple[str, object, Optional[str], str]:
     if len(message) >= 4:
         subject, received_time, sender_name, body_text = message[:4]
@@ -867,6 +917,10 @@ def _is_techqa_completed(text: str) -> bool:
 
 def _is_finalqa_handoff(text: str) -> bool:
     return bool(FINAL_QA_RE.search(text) or PROCEED_FINAL_QA_RE.search(text))
+
+
+def _is_techqa_pickup_response(text: str) -> bool:
+    return bool(TECHQA_PICKUP_RE.search(text or ""))
 
 
 def _safe_log_text(value: object, max_len: int = 500) -> str:
@@ -1147,6 +1201,9 @@ def parse_stats_by_aaid_from_messages(
     unique_stop_day_by_aaid: dict[str, set[str]] = {}
     finalqa_start_candidates_by_aaid: dict[str, list[datetime]] = {}
     finalqa_event_times_by_aaid: dict[str, list[datetime]] = {}
+    finalqa_sender_events_by_aaid: dict[str, list[tuple[datetime, str]]] = {}
+    techqa_pickup_candidates_by_aaid: dict[str, list[tuple[datetime, str]]] = {}
+    techqa_non_tester_candidates_by_aaid: dict[str, list[tuple[datetime, str]]] = {}
 
     # First pass: collect stats and track start notifications
     for msg in message_list:
@@ -1234,15 +1291,9 @@ def parse_stats_by_aaid_from_messages(
     # Second pass: set sender for earliest start notification
     for aaid, start_notifications in start_notifications_by_aaid.items():
         if aaid in stats_by_aaid and start_notifications:
-            # Sort by time to find earliest
-            earliest_with_sender = None
-            for event_time, sender in sorted(start_notifications, key=lambda x: (x[0] is None, x[0])):
-                if sender:
-                    earliest_with_sender = sender
-                    break
-            # If we found a sender, use it
-            if earliest_with_sender:
-                stats_by_aaid[aaid].first_start_notification_sender = earliest_with_sender
+            tester_sender = _select_tester_from_start_notifications(start_notifications)
+            if tester_sender:
+                stats_by_aaid[aaid].first_start_notification_sender = tester_sender
 
     sorted_for_timeline = sorted(
         message_list,
@@ -1260,23 +1311,24 @@ def parse_stats_by_aaid_from_messages(
     #   - Final QA Person  = earliest FinalQA email sender that is NOT the tester.
     # Start/Stop datetimes are still driven by _apply_message_to_stats.
     for msg in sorted_for_timeline:
-        subject, received_time, sender_name, _body_text = _unpack_message(msg)
-        if not subject:
+        subject, received_time, sender_name, body_text = _unpack_message(msg)
+        if not subject and not body_text:
             continue
 
         event_time = _message_event_time(received_time)
         if event_time is None:
             continue
 
-        aaid = extract_aaid(subject)
+        aaid = _extract_aaid_from_message(subject, body_text)
         if aaid not in stats_by_aaid:
             continue
 
         stats = stats_by_aaid[aaid]
         tester_name = stats.first_start_notification_sender
+        message_text = _combine_message_text(subject, body_text)
 
         if (
-            _is_techqa(subject)
+            _is_techqa(message_text)
             and stats.techqa_milestone_at is None
             and tester_name is not None
             and sender_name is not None
@@ -1285,38 +1337,24 @@ def parse_stats_by_aaid_from_messages(
             stats.techqa_milestone_at = event_time
 
         if (
-            _is_techqa(subject)
-            and stats.techqa_person is None
-            and sender_name is not None
-            and not _same_person(sender_name, tester_name)
-            and not _same_person(sender_name, stats.finalqa_person)
-        ):
-            stats.techqa_person = sender_name
-
-        # TechQA Start = earliest TechQA email from someone OTHER than the tester
-        # (i.e. when the QA reviewer first responds).
-        if (
-            _is_techqa(subject)
-            and stats.techqa_start is None
+            _is_techqa(message_text)
             and sender_name is not None
             and tester_name is not None
-            and sender_name != tester_name
+            and not _same_person(sender_name, tester_name)
         ):
-            stats.techqa_start = event_time
+            techqa_non_tester_candidates_by_aaid.setdefault(aaid, []).append((event_time, sender_name))
+            if _is_techqa_pickup_response(message_text):
+                techqa_pickup_candidates_by_aaid.setdefault(aaid, []).append((event_time, sender_name))
 
-        # TechQA End = earliest FinalQA-subject email sent by the TechQA Person
-        # (the same QA reviewer changes the subject to Final QA, handing off).
         if (
-            _is_finalqa(subject)
-            and stats.techqa_stop is None
-            and stats.techqa_person is not None
+            _is_finalqa(message_text)
             and sender_name is not None
-            and _same_person(sender_name, stats.techqa_person)
+            and event_time is not None
         ):
-            stats.techqa_stop = event_time
+            finalqa_sender_events_by_aaid.setdefault(aaid, []).append((event_time, sender_name))
 
         if (
-            _is_finalqa(subject)
+            _is_finalqa(message_text)
             and stats.finalqa_person is None
             and sender_name is not None
             and not _same_person(sender_name, tester_name)
@@ -1326,7 +1364,7 @@ def parse_stats_by_aaid_from_messages(
 
         # Final QA Start = earliest FinalQA email from someone OTHER than the tester.
         if (
-            _is_finalqa(subject)
+            _is_finalqa(message_text)
             and stats.finalqa_start is None
             and sender_name is not None
             and tester_name is not None
@@ -1336,7 +1374,7 @@ def parse_stats_by_aaid_from_messages(
         ):
             stats.finalqa_start = event_time
 
-        if _is_finalqa(subject):
+        if _is_finalqa(message_text):
             if event_time is not None:
                 finalqa_event_times_by_aaid.setdefault(aaid, []).append(event_time)
             if (
@@ -1348,6 +1386,35 @@ def parse_stats_by_aaid_from_messages(
                 finalqa_start_candidates_by_aaid.setdefault(aaid, []).append(event_time)
 
     for aaid, stats in stats_by_aaid.items():
+        # TechQA Person is inferred from non-tester TechQA responses, preferring
+        # explicit "pickup" language (e.g. "I am working on it", "I will pick this").
+        pickup_candidates = sorted(
+            techqa_pickup_candidates_by_aaid.get(aaid, []),
+            key=lambda item: (item[0], _sender_dedupe_key(item[1])),
+        )
+        non_tester_candidates = sorted(
+            techqa_non_tester_candidates_by_aaid.get(aaid, []),
+            key=lambda item: (item[0], _sender_dedupe_key(item[1])),
+        )
+        selected_techqa_candidate = pickup_candidates[0] if pickup_candidates else (
+            non_tester_candidates[0] if non_tester_candidates else None
+        )
+        if selected_techqa_candidate is not None:
+            selected_time, selected_person = selected_techqa_candidate
+            stats.techqa_person = selected_person
+            stats.techqa_start = selected_time
+
+        # TechQA End = earliest FinalQA-subject email sent by the TechQA Person.
+        if stats.techqa_person:
+            techqa_handoff_times = [
+                event_time
+                for event_time, sender_name in finalqa_sender_events_by_aaid.get(aaid, [])
+                if _same_person(sender_name, stats.techqa_person)
+                and (stats.techqa_start is None or event_time >= stats.techqa_start)
+            ]
+            if techqa_handoff_times:
+                stats.techqa_stop = min(techqa_handoff_times)
+
         # Final QA must start/end after TechQA start and TechQA end when those
         # milestones are available.
         start_candidates = finalqa_start_candidates_by_aaid.get(aaid, [])
