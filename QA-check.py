@@ -1199,7 +1199,6 @@ def parse_stats_by_aaid_from_messages(
     start_notifications_by_aaid: dict[str, list[tuple[Optional[datetime], Optional[str]]]] = {}
     unique_start_day_by_aaid: dict[str, set[str]] = {}
     unique_stop_day_by_aaid: dict[str, set[str]] = {}
-    finalqa_start_candidates_by_aaid: dict[str, list[datetime]] = {}
     finalqa_event_times_by_aaid: dict[str, list[datetime]] = {}
     finalqa_sender_events_by_aaid: dict[str, list[tuple[datetime, str]]] = {}
     techqa_pickup_candidates_by_aaid: dict[str, list[tuple[datetime, str]]] = {}
@@ -1346,44 +1345,14 @@ def parse_stats_by_aaid_from_messages(
             if _is_techqa_pickup_response(message_text):
                 techqa_pickup_candidates_by_aaid.setdefault(aaid, []).append((event_time, sender_name))
 
-        if (
-            _is_finalqa(message_text)
-            and sender_name is not None
-            and event_time is not None
-        ):
+        is_finalqa_signal = _is_finalqa(message_text) or _is_finalqa_handoff(message_text)
+
+        if is_finalqa_signal and sender_name is not None and event_time is not None:
             finalqa_sender_events_by_aaid.setdefault(aaid, []).append((event_time, sender_name))
 
-        if (
-            _is_finalqa(message_text)
-            and stats.finalqa_person is None
-            and sender_name is not None
-            and not _same_person(sender_name, tester_name)
-            and not _same_person(sender_name, stats.techqa_person)
-        ):
-            stats.finalqa_person = sender_name
-
-        # Final QA Start = earliest FinalQA email from someone OTHER than the tester.
-        if (
-            _is_finalqa(message_text)
-            and stats.finalqa_start is None
-            and sender_name is not None
-            and tester_name is not None
-            and sender_name != tester_name
-            and (stats.techqa_start is None or event_time > stats.techqa_start)
-            and (stats.techqa_stop is None or event_time > stats.techqa_stop)
-        ):
-            stats.finalqa_start = event_time
-
-        if _is_finalqa(message_text):
+        if is_finalqa_signal:
             if event_time is not None:
                 finalqa_event_times_by_aaid.setdefault(aaid, []).append(event_time)
-            if (
-                event_time is not None
-                and sender_name is not None
-                and tester_name is not None
-                and sender_name != tester_name
-            ):
-                finalqa_start_candidates_by_aaid.setdefault(aaid, []).append(event_time)
 
     for aaid, stats in stats_by_aaid.items():
         # TechQA Person is inferred from non-tester TechQA responses, preferring
@@ -1404,7 +1373,7 @@ def parse_stats_by_aaid_from_messages(
             stats.techqa_person = selected_person
             stats.techqa_start = selected_time
 
-        # TechQA End = earliest FinalQA-subject email sent by the TechQA Person.
+        # TechQA End = earliest FinalQA/handoff signal sent by the TechQA Person.
         if stats.techqa_person:
             techqa_handoff_times = [
                 event_time
@@ -1415,9 +1384,8 @@ def parse_stats_by_aaid_from_messages(
             if techqa_handoff_times:
                 stats.techqa_stop = min(techqa_handoff_times)
 
-        # Final QA must start/end after TechQA start and TechQA end when those
-        # milestones are available.
-        start_candidates = finalqa_start_candidates_by_aaid.get(aaid, [])
+        # Final QA person must be someone other than tester and TechQA person.
+        all_finalqa_sender_events = finalqa_sender_events_by_aaid.get(aaid, [])
         all_finalqa_events = finalqa_event_times_by_aaid.get(aaid, [])
 
         def _is_after_techqa(candidate_time: datetime) -> bool:
@@ -1427,13 +1395,45 @@ def parse_stats_by_aaid_from_messages(
                 return False
             return True
 
-        eligible_start_candidates = [t for t in start_candidates if _is_after_techqa(t)]
-        stats.finalqa_start = min(eligible_start_candidates) if eligible_start_candidates else None
+        eligible_finalqa_sender_events = [
+            (event_time, sender_name)
+            for event_time, sender_name in all_finalqa_sender_events
+            if _is_after_techqa(event_time)
+            and not _same_person(sender_name, stats.first_start_notification_sender)
+            and (stats.techqa_person is None or not _same_person(sender_name, stats.techqa_person))
+        ]
+        eligible_finalqa_sender_events.sort(key=lambda item: (item[0], _sender_dedupe_key(item[1])))
 
-        eligible_end_candidates = [t for t in all_finalqa_events if _is_after_techqa(t)]
-        if stats.finalqa_start is not None:
-            eligible_end_candidates = [t for t in eligible_end_candidates if t >= stats.finalqa_start]
-        stats.finalqa_stop = max(eligible_end_candidates) if eligible_end_candidates else None
+        stats.finalqa_person = eligible_finalqa_sender_events[0][1] if eligible_finalqa_sender_events else None
+
+        if stats.finalqa_person is not None:
+            finalqa_person_times = [
+                event_time
+                for event_time, sender_name in eligible_finalqa_sender_events
+                if _same_person(sender_name, stats.finalqa_person)
+            ]
+            stats.finalqa_start = min(finalqa_person_times) if finalqa_person_times else None
+            if stats.finalqa_start is not None:
+                finalqa_end_candidates = [t for t in finalqa_person_times if t >= stats.finalqa_start]
+                stats.finalqa_stop = max(finalqa_end_candidates) if finalqa_end_candidates else None
+            else:
+                stats.finalqa_stop = None
+        else:
+            stats.finalqa_start = None
+            stats.finalqa_stop = None
+
+        # Safety guard: Final QA person must never be the tester.
+        if _same_person(stats.finalqa_person, stats.first_start_notification_sender):
+            stats.finalqa_person = None
+            stats.finalqa_start = None
+            stats.finalqa_stop = None
+
+        # Fallback when sender identity cannot be determined reliably.
+        if stats.finalqa_start is None and stats.finalqa_person is None:
+            eligible_end_candidates = [t for t in all_finalqa_events if _is_after_techqa(t)]
+            if eligible_end_candidates:
+                stats.finalqa_start = min(eligible_end_candidates)
+                stats.finalqa_stop = max(eligible_end_candidates)
 
         if stats.first_start_notification_at and stats.last_stop_notification_at:
             stats.completion_days_count = count_days_inclusive(
