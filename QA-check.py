@@ -834,7 +834,12 @@ def _sender_dedupe_key(sender_name: Optional[str]) -> str:
     normalized = _normalize_sender_name(sender_name)
     if normalized is None:
         return "__unknown_sender__"
-    return normalized.casefold()
+    key = normalized.casefold()
+    # Normalize common Outlook display variations so person-comparison is stable.
+    key = re.sub(r"<[^>]+>", "", key)       # remove inline email addresses
+    key = re.sub(r"\([^)]*\)", "", key)     # remove bracketed qualifiers
+    key = re.sub(r"[^a-z0-9]", "", key)      # collapse punctuation/spacing
+    return key or "__unknown_sender__"
 
 
 def _same_person(left: Optional[str], right: Optional[str]) -> bool:
